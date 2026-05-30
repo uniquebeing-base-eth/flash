@@ -1,11 +1,13 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useEffect, useMemo, useState } from "react";
+import { useState } from "react";
 import { User, History, Trophy, ChevronDown, TrendingUp, TrendingDown, Shuffle, Eye, Info, Zap } from "lucide-react";
 import { MARKETS, type Market } from "@/components/flash/markets";
 import { Chart } from "@/components/flash/Chart";
 import { AccountDrawer } from "@/components/flash/AccountDrawer";
 import { HistoryDrawer } from "@/components/flash/HistoryDrawer";
 import { LeaderboardDrawer } from "@/components/flash/LeaderboardDrawer";
+import { UsernameGate } from "@/components/flash/UsernameGate";
+import { useLiveMarket } from "@/lib/marketData";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -16,10 +18,14 @@ export const Route = createFileRoute("/")({
       { property: "og:description", content: "MiniPay-native perpetual trading. Crypto, forex, commodities." },
     ],
   }),
-  component: Index,
+  component: Page,
 });
 
-function Index() {
+function Page() {
+  return <UsernameGate>{(session) => <Index session={session} />}</UsernameGate>;
+}
+
+function Index({ session }: { session: { wallet: string; username: string } }) {
   const [marketIdx, setMarketIdx] = useState(1); // ETH default
   const [marketOpen, setMarketOpen] = useState(false);
   const [timeframe, setTimeframe] = useState("1h");
@@ -27,20 +33,11 @@ function Index() {
   const [sizePct, setSizePct] = useState(0);
   const [drawer, setDrawer] = useState<null | "account" | "history" | "lb">(null);
   const [position, setPosition] = useState<null | { dir: "LONG" | "SHORT"; entry: number; size: number; lev: number; margin: number; sym: string }>(null);
-  const [tick, setTick] = useState(0);
 
   const market = MARKETS[marketIdx];
   const balance = 1.64;
 
-  // live price wiggle
-  useEffect(() => {
-    const id = setInterval(() => setTick(t => t + 1), 1500);
-    return () => clearInterval(id);
-  }, []);
-  const livePrice = useMemo(() => {
-    const noise = Math.sin(tick * 0.7 + marketIdx) * market.price * 0.0008;
-    return +(market.price + noise).toFixed(market.price < 10 ? 4 : 2);
-  }, [tick, market, marketIdx]);
+  const { candles, price: livePrice } = useLiveMarket(market.binance, market.symbol, market.price, timeframe);
 
   const sizeUsd = +(balance * (sizePct / 100) * leverage || 1).toFixed(2);
   const margin = +(sizeUsd / leverage).toFixed(2);
@@ -123,7 +120,13 @@ function Index() {
         )}
 
         {/* CHART */}
-        <Chart price={livePrice} symbol={market.symbol} entryPrice={position?.entry} liqPrice={position ? (position.dir === "LONG" ? liqL : liqS) : undefined} />
+        <Chart
+          candles={candles}
+          price={livePrice}
+          entryPrice={position?.entry}
+          liqPrice={position ? (position.dir === "LONG" ? liqL : liqS) : undefined}
+          isLive={!!market.binance}
+        />
 
         {/* TIMEFRAMES */}
         <div className="flex gap-1.5">
@@ -231,7 +234,7 @@ function Index() {
 
         {/* SPLASH BRAND */}
         <div className="pt-6 pb-2 text-center text-[10px] uppercase tracking-[0.2em] text-muted-foreground flex items-center justify-center gap-1">
-          <Zap className="w-3 h-3" /> Flash · Perps Made Simple · MiniPay Native
+          <Zap className="w-3 h-3" /> @{session.username} · Flash · MiniPay Native
         </div>
       </div>
 
