@@ -1,80 +1,103 @@
-import { useMemo } from "react";
+import type { Candle } from "@/lib/marketData";
 
-interface Candle { o: number; h: number; l: number; c: number; }
-
-function genCandles(seed: number, count: number, base: number): Candle[] {
-  let s = seed;
-  const rand = () => { s = (s * 9301 + 49297) % 233280; return s / 233280; };
-  const out: Candle[] = [];
-  let price = base;
-  for (let i = 0; i < count; i++) {
-    const o = price;
-    const change = (rand() - 0.5) * base * 0.015;
-    const c = o + change;
-    const h = Math.max(o, c) + rand() * base * 0.008;
-    const l = Math.min(o, c) - rand() * base * 0.008;
-    out.push({ o, h, l, c });
-    price = c;
-  }
-  return out;
+interface Props {
+  candles: Candle[];
+  price: number;
+  entryPrice?: number;
+  liqPrice?: number;
+  isLive?: boolean;
 }
 
-export function Chart({ price, symbol, entryPrice, liqPrice }: { price: number; symbol: string; entryPrice?: number; liqPrice?: number }) {
-  const candles = useMemo(() => {
-    const seed = symbol.split("").reduce((a, c) => a + c.charCodeAt(0), 0);
-    return genCandles(seed, 40, price);
-  }, [symbol, price]);
+function fmt(n: number) {
+  if (n >= 1000) return n.toFixed(0);
+  if (n >= 10) return n.toFixed(2);
+  if (n >= 1) return n.toFixed(3);
+  return n.toFixed(5);
+}
 
-  const all = candles.flatMap(c => [c.h, c.l]);
+export function Chart({ candles, price, entryPrice, liqPrice, isLive }: Props) {
+  if (!candles.length) {
+    return (
+      <div className="box p-2 bg-white">
+        <div className="h-48 grid place-items-center text-xs text-muted-foreground font-mono">LOADING MARKET DATA…</div>
+      </div>
+    );
+  }
+
+  const all: number[] = [];
+  for (const c of candles) { all.push(c.h, c.l); }
   if (entryPrice) all.push(entryPrice);
   if (liqPrice) all.push(liqPrice);
-  const min = Math.min(...all) * 0.998;
-  const max = Math.max(...all) * 1.002;
-  const w = 320, h = 200, pad = 8;
-  const cw = (w - pad * 2) / candles.length;
-  const y = (v: number) => pad + ((max - v) / (max - min)) * (h - pad * 2);
+  all.push(price);
+  const rawMin = Math.min(...all);
+  const rawMax = Math.max(...all);
+  const pad = (rawMax - rawMin) * 0.08 || rawMax * 0.002;
+  const min = rawMin - pad;
+  const max = rawMax + pad;
+
+  const W = 320, H = 200, padL = 4, padR = 44, padY = 6;
+  const innerW = W - padL - padR;
+  const cw = innerW / candles.length;
+  const y = (v: number) => padY + ((max - v) / (max - min)) * (H - padY * 2);
 
   return (
     <div className="box p-2 bg-white">
-      <svg viewBox={`0 0 ${w} ${h}`} className="w-full h-48">
-        {[0.25, 0.5, 0.75].map(p => (
-          <line key={p} x1={0} x2={w} y1={h * p} y2={h * p} stroke="#e5e5e5" strokeDasharray="2 3" />
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-48" preserveAspectRatio="none">
+        {/* gridlines */}
+        {[0.2, 0.4, 0.6, 0.8].map(p => (
+          <line key={p} x1={0} x2={W - padR} y1={H * p} y2={H * p} stroke="#ececec" strokeDasharray="2 3" />
         ))}
+        {/* candles */}
         {candles.map((c, i) => {
-          const x = pad + i * cw + cw / 2;
+          const x = padL + i * cw + cw / 2;
           const up = c.c >= c.o;
+          const color = up ? "var(--profit)" : "var(--loss)";
+          const bodyTop = y(Math.max(c.o, c.c));
+          const bodyH = Math.max(1, Math.abs(y(c.o) - y(c.c)));
+          const bodyW = Math.max(1.5, cw * 0.7);
           return (
-            <g key={i}>
-              <line x1={x} x2={x} y1={y(c.h)} y2={y(c.l)} stroke="#0a0a0a" strokeWidth={1} />
+            <g key={c.t}>
+              <line x1={x} x2={x} y1={y(c.h)} y2={y(c.l)} stroke={`oklch(from ${color} l c h)`} strokeWidth={1} />
               <rect
-                x={x - cw * 0.35}
-                y={y(Math.max(c.o, c.c))}
-                width={cw * 0.7}
-                height={Math.max(1, Math.abs(y(c.o) - y(c.c)))}
-                fill={up ? "#fff" : "#0a0a0a"}
+                x={x - bodyW / 2}
+                y={bodyTop}
+                width={bodyW}
+                height={bodyH}
+                fill={up ? "var(--profit)" : "var(--loss)"}
                 stroke="#0a0a0a"
-                strokeWidth={1}
+                strokeWidth={0.6}
               />
             </g>
           );
         })}
-        {entryPrice && (
-          <>
-            <line x1={0} x2={w} y1={y(entryPrice)} y2={y(entryPrice)} stroke="oklch(0.65 0.22 145)" strokeWidth={1.2} strokeDasharray="4 3" />
-            <rect x={w - 56} y={y(entryPrice) - 8} width={54} height={16} fill="oklch(0.65 0.22 145)" />
-            <text x={w - 4} y={y(entryPrice) + 4} fontSize="10" textAnchor="end" fill="#fff" fontWeight="700">{entryPrice.toFixed(0)}</text>
-          </>
+        {/* entry / liq lines */}
+        {entryPrice !== undefined && (
+          <g>
+            <line x1={0} x2={W - padR} y1={y(entryPrice)} y2={y(entryPrice)} stroke="oklch(0.65 0.22 145)" strokeWidth={1.2} strokeDasharray="4 3" />
+            <rect x={W - padR + 1} y={y(entryPrice) - 8} width={padR - 2} height={16} fill="oklch(0.65 0.22 145)" />
+            <text x={W - 3} y={y(entryPrice) + 4} fontSize="9" textAnchor="end" fill="#fff" fontWeight="700">{fmt(entryPrice)}</text>
+          </g>
         )}
-        {liqPrice && (
-          <>
-            <line x1={0} x2={w} y1={y(liqPrice)} y2={y(liqPrice)} stroke="oklch(0.62 0.24 25)" strokeWidth={1.2} strokeDasharray="4 3" />
-            <rect x={w - 56} y={y(liqPrice) - 8} width={54} height={16} fill="oklch(0.62 0.24 25)" />
-            <text x={w - 4} y={y(liqPrice) + 4} fontSize="10" textAnchor="end" fill="#fff" fontWeight="700">{liqPrice.toFixed(0)}</text>
-          </>
+        {liqPrice !== undefined && (
+          <g>
+            <line x1={0} x2={W - padR} y1={y(liqPrice)} y2={y(liqPrice)} stroke="oklch(0.62 0.24 25)" strokeWidth={1.2} strokeDasharray="4 3" />
+            <rect x={W - padR + 1} y={y(liqPrice) - 8} width={padR - 2} height={16} fill="oklch(0.62 0.24 25)" />
+            <text x={W - 3} y={y(liqPrice) + 4} fontSize="9" textAnchor="end" fill="#fff" fontWeight="700">{fmt(liqPrice)}</text>
+          </g>
         )}
         {/* current price tag */}
-        <rect x={w - 56} y={y(price) - 8} width={54} height={16} fill="#0a0a0a" />
-        <text x={w - 4} y={y(price) + 4} fontSize="10" textAnchor="end" fill="#fff" fontWeight="700">{price.toFixed(2)}</text>
+        <line x1={0} x2={W - padR} y1={y(price)} y2={y(price)} stroke="#0a0a0a" strokeWidth={0.6} strokeDasharray="1 2" />
+        <rect x={W - padR + 1} y={y(price) - 8} width={padR - 2} height={16} fill="#0a0a0a" />
+        <text x={W - 3} y={y(price) + 4} fontSize="9" textAnchor="end" fill="#fff" fontWeight="700">{fmt(price)}</text>
+        {/* live badge */}
+        {isLive && (
+          <g>
+            <circle cx={8} cy={10} r={3} fill="var(--loss)">
+              <animate attributeName="opacity" values="1;0.3;1" dur="1.4s" repeatCount="indefinite" />
+            </circle>
+            <text x={15} y={13} fontSize="8" fontWeight="700" fill="#0a0a0a">LIVE</text>
+          </g>
+        )}
       </svg>
     </div>
   );
