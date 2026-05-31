@@ -1,8 +1,18 @@
-import { useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { Drawer } from "./Drawer";
-import { User, ChevronDown, TrendingUp, Clock } from "lucide-react";
+import { User, ChevronDown, TrendingUp, TrendingDown, Loader2, ExternalLink } from "lucide-react";
+import { toast } from "sonner";
+import {
+  FLASH_VAULT_ADDRESS,
+  depositCusd,
+  withdrawCusd,
+  getVaultBalance,
+  getWalletCusdBalance,
+} from "@/lib/flashVault";
 
-export function AccountDrawer({ open, onClose }: { open: boolean; onClose: () => void }) {
+interface Session { wallet: string; username: string; }
+
+export function AccountDrawer({ open, onClose, session }: { open: boolean; onClose: () => void; session: Session }) {
   const [tab, setTab] = useState<"profile" | "wallet" | "settings">("wallet");
   return (
     <Drawer open={open} onClose={onClose} title="ACCOUNT" icon={<User className="w-7 h-7" strokeWidth={2.5} />}>
@@ -12,86 +22,140 @@ export function AccountDrawer({ open, onClose }: { open: boolean; onClose: () =>
         ))}
       </div>
 
-      {tab === "wallet" && <WalletTab />}
-      {tab === "profile" && <ProfileTab />}
+      {tab === "wallet" && <WalletTab session={session} />}
+      {tab === "profile" && <ProfileTab session={session} />}
       {tab === "settings" && <SettingsTab />}
     </Drawer>
   );
 }
 
-function WalletTab() {
-  const [chain, setChain] = useState("CELO");
-  const [asset, setAsset] = useState("cUSD");
+function WalletTab({ session }: { session: Session }) {
+  const [mode, setMode] = useState<"deposit" | "withdraw">("deposit");
   const [amount, setAmount] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [vaultBal, setVaultBal] = useState("0");
+  const [walletBal, setWalletBal] = useState("0");
+  const [lastTx, setLastTx] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      const [v, w] = await Promise.all([
+        getVaultBalance(session.wallet),
+        getWalletCusdBalance(session.wallet),
+      ]);
+      setVaultBal(v);
+      setWalletBal(w);
+    } catch { /* wallet may not be ready */ }
+  }, [session.wallet]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const max = mode === "deposit" ? walletBal : vaultBal;
+  const num = parseFloat(amount || "0");
+  const valid = num > 0 && num <= parseFloat(max || "0");
+
+  const submit = async () => {
+    if (!FLASH_VAULT_ADDRESS) { toast.error("Vault not deployed yet. Deploy FlashVault.sol and set VITE_FLASH_VAULT_ADDRESS."); return; }
+    if (!valid) return;
+    setBusy(true);
+    setLastTx(null);
+    try {
+      toast.loading(mode === "deposit" ? "Depositing cUSD…" : "Withdrawing cUSD…", { id: "vtx" });
+      const isMax = num === parseFloat(max);
+      const hash = mode === "deposit"
+        ? await depositCusd(amount)
+        : await withdrawCusd(isMax ? "max" : amount);
+      setLastTx(hash);
+      toast.success(mode === "deposit" ? "Deposited" : "Withdrawn", { id: "vtx" });
+      setAmount("");
+      await refresh();
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Transaction failed";
+      toast.error(msg.length > 80 ? msg.slice(0, 80) + "…" : msg, { id: "vtx" });
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div className="space-y-4">
       <div className="grid grid-cols-2 gap-3">
         <div className="box-sm p-3 bg-[color:var(--yellow-accent)]">
-          <div className="text-[10px] uppercase tracking-wider mb-1">Net Worth</div>
-          <div className="font-display text-2xl">$1.64</div>
+          <div className="text-[10px] uppercase tracking-wider mb-1">Vault Balance</div>
+          <div className="font-display text-2xl">${parseFloat(vaultBal).toFixed(2)}</div>
         </div>
         <div className="box-sm p-3">
-          <div className="text-[10px] uppercase tracking-wider mb-1 text-muted-foreground">Available</div>
-          <div className="font-display text-2xl">$1.64</div>
+          <div className="text-[10px] uppercase tracking-wider mb-1 text-muted-foreground">In Wallet</div>
+          <div className="font-display text-2xl">${parseFloat(walletBal).toFixed(2)}</div>
         </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-3">
-        <button className="box-sm py-4 font-display text-lg bg-[color:var(--profit)] text-white">DEPOSIT</button>
-        <button className="box-sm py-4 font-display text-lg">WITHDRAW</button>
-      </div>
-
-      <div className="grid grid-cols-2 gap-3">
-        <Select value={chain} onChange={setChain} options={["CELO", "ARB", "ETH"]} />
-        <Select value={asset} onChange={setAsset} options={["cUSD", "cEUR", "CELO"]} />
+      <div className="grid grid-cols-2 gap-0 box-sm p-1">
+        {(["deposit", "withdraw"] as const).map(m => (
+          <button key={m} onClick={() => { setMode(m); setAmount(""); }} className={`py-3 text-xs font-bold uppercase tracking-wider ${mode === m ? "bg-foreground text-background" : ""}`}>{m}</button>
+        ))}
       </div>
 
       <div className="box-inset p-4">
-        <input value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0.00" className="w-full bg-transparent outline-none text-2xl font-mono" />
+        <input
+          value={amount}
+          onChange={(e) => setAmount(e.target.value.replace(/[^0-9.]/g, ""))}
+          placeholder="0.00"
+          inputMode="decimal"
+          className="w-full bg-transparent outline-none text-2xl font-mono"
+        />
       </div>
 
       <div className="flex items-center justify-between text-xs">
-        <span className="text-muted-foreground">Balance: 1.64 cUSD</span>
+        <span className="text-muted-foreground">{mode === "deposit" ? "Wallet" : "Vault"}: {parseFloat(max).toFixed(4)} cUSD</span>
         <div className="flex gap-1">
-          {["25%", "50%", "MAX"].map(p => (
-            <button key={p} className="box-sm px-2 py-1 text-[10px] font-bold">{p}</button>
+          {[0.25, 0.5, 1].map(p => (
+            <button key={p} onClick={() => setAmount((parseFloat(max) * p).toString())} className="box-sm px-2 py-1 text-[10px] font-bold">
+              {p === 1 ? "MAX" : `${p * 100}%`}
+            </button>
           ))}
         </div>
       </div>
 
-      <div className="text-xs text-[color:var(--cyan-accent)] font-bold">Min $1.50 recommended (bridge fees apply)</div>
+      <button
+        onClick={submit}
+        disabled={!valid || busy}
+        className={`box w-full font-display text-lg py-4 flex items-center justify-center gap-2 disabled:opacity-50 ${mode === "deposit" ? "bg-[color:var(--profit)] text-white" : "bg-[color:var(--yellow-accent)]"}`}
+      >
+        {busy ? <Loader2 className="w-5 h-5 animate-spin" /> : mode === "deposit" ? <TrendingUp className="w-5 h-5" /> : <TrendingDown className="w-5 h-5" />}
+        {busy ? "PROCESSING…" : mode === "deposit" ? "DEPOSIT cUSD" : "WITHDRAW cUSD"}
+      </button>
 
-      <div className="grid grid-cols-[1fr_auto] gap-2">
-        <button className="box font-display text-lg py-4 bg-[color:var(--profit)] text-white flex items-center justify-center gap-2">
-          <TrendingUp className="w-5 h-5" /> DEPOSIT
-        </button>
-        <button className="box-sm w-14 grid place-items-center bg-white">
-          <Clock className="w-5 h-5" />
-        </button>
-      </div>
+      {lastTx && (
+        <a href={`https://celoscan.io/tx/${lastTx}`} target="_blank" rel="noreferrer" className="flex items-center justify-center gap-1 text-xs text-[color:var(--cyan-accent)] font-bold">
+          View transaction <ExternalLink className="w-3 h-3" />
+        </a>
+      )}
 
-      <div className="text-center text-xs text-muted-foreground">
-        Powered by <span className="font-bold text-foreground">⚡ Flash Bridge</span>
-      </div>
+      {!FLASH_VAULT_ADDRESS && (
+        <div className="border-t border-dashed pt-3 text-xs text-[color:var(--loss)] leading-relaxed">
+          ⚠ FlashVault contract not deployed. Deploy <span className="font-mono">contracts/FlashVault.sol</span> with constructor arg <span className="font-mono">0x765DE816845861e75A25fCA122bb6898B8B1282a</span> (cUSD), then set <span className="font-mono">VITE_FLASH_VAULT_ADDRESS</span>.
+        </div>
+      )}
 
       <div className="border-t border-dashed pt-3 text-xs text-muted-foreground leading-relaxed">
-        * Deposits from cUSD/cEUR/CELO on Celo are auto-bridged to Arbitrum USDC and credited to your trading balance.
+        Non-custodial cUSD vault on Celo. Only you can withdraw your balance. ~$0.001 gas per tx.
       </div>
     </div>
   );
 }
 
-function ProfileTab() {
+function ProfileTab({ session }: { session: Session }) {
   return (
     <div className="space-y-4">
       <div className="box-sm p-4">
         <div className="text-[10px] uppercase tracking-wider mb-2 text-muted-foreground">Profile</div>
         <div className="flex items-center gap-3">
-          <div className="w-14 h-14 box-sm grid place-items-center bg-[color:var(--magenta-accent)] text-white font-display text-xl">F</div>
+          <div className="w-14 h-14 box-sm grid place-items-center bg-[color:var(--magenta-accent)] text-white font-display text-xl">{session.username.slice(0, 1).toUpperCase()}</div>
           <div>
-            <div className="font-display text-lg">Trader</div>
-            <div className="text-xs text-muted-foreground">@flashuser</div>
-            <div className="text-xs text-muted-foreground">0x0000…0000</div>
+            <div className="font-display text-lg">{session.username}</div>
+            <div className="text-xs text-muted-foreground">@{session.username}</div>
+            <div className="text-xs text-muted-foreground font-mono">{session.wallet.slice(0, 6)}…{session.wallet.slice(-4)}</div>
           </div>
         </div>
       </div>
@@ -106,7 +170,7 @@ function ProfileTab() {
       <Streak />
       <div className="box-sm p-4">
         <div className="text-[10px] uppercase tracking-wider mb-2 text-muted-foreground">Referral</div>
-        <div className="font-mono text-sm break-all">flash.xyz/ref/flashuser</div>
+        <div className="font-mono text-sm break-all">flash.xyz/ref/{session.username}</div>
         <div className="mt-3 grid grid-cols-3 gap-2 text-center">
           <div><div className="text-[10px] text-muted-foreground">Refs</div><div className="font-display">0</div></div>
           <div><div className="text-[10px] text-muted-foreground">Earnings</div><div className="font-display">$0</div></div>
@@ -155,17 +219,6 @@ function SettingsTab() {
           <ChevronDown className="w-4 h-4 -rotate-90" />
         </div>
       ))}
-    </div>
-  );
-}
-
-function Select({ value, onChange, options }: { value: string; onChange: (v: string) => void; options: string[] }) {
-  return (
-    <div className="box-sm relative">
-      <select value={value} onChange={(e) => onChange(e.target.value)} className="w-full appearance-none bg-transparent px-4 py-3 font-bold text-sm pr-8 outline-none">
-        {options.map(o => <option key={o}>{o}</option>)}
-      </select>
-      <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 pointer-events-none" />
     </div>
   );
 }
