@@ -7,6 +7,10 @@
 import { defineConfig } from "@lovable.dev/vite-tanstack-config";
 
 export default defineConfig({
+  // Explicit empty plugins array so Cloudflare's `wrangler deploy` auto-config
+  // (which AST-edits this file to inject the Workers plugin) can find a valid
+  // plugins array. The Lovable preset already registers all required plugins.
+  plugins: [],
   tanstackStart: {
     // Redirect TanStack Start's bundled server entry to src/server.ts (our SSR error wrapper).
     // nitro/vite builds from this
