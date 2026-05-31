@@ -8,6 +8,8 @@ import { HistoryDrawer } from "@/components/flash/HistoryDrawer";
 import { LeaderboardDrawer } from "@/components/flash/LeaderboardDrawer";
 import { UsernameGate } from "@/components/flash/UsernameGate";
 import { useLiveMarket } from "@/lib/marketData";
+import { getVaultBalance, FLASH_VAULT_ADDRESS } from "@/lib/flashVault";
+import { useEffect } from "react";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -33,9 +35,24 @@ function Index({ session }: { session: { wallet: string; username: string } }) {
   const [sizePct, setSizePct] = useState(0);
   const [drawer, setDrawer] = useState<null | "account" | "history" | "lb">(null);
   const [position, setPosition] = useState<null | { dir: "LONG" | "SHORT"; entry: number; size: number; lev: number; margin: number; sym: string }>(null);
+  const [balance, setBalance] = useState(0);
+
+  // Poll on-chain vault balance
+  useEffect(() => {
+    if (!FLASH_VAULT_ADDRESS) return;
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const b = await getVaultBalance(session.wallet);
+        if (!cancelled) setBalance(parseFloat(b));
+      } catch { /* ignore */ }
+    };
+    load();
+    const id = setInterval(load, 15000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [session.wallet, drawer]);
 
   const market = MARKETS[marketIdx];
-  const balance = 1.64;
 
   const { candles, price: livePrice } = useLiveMarket(market.binance, market.symbol, market.price, timeframe);
 
@@ -238,7 +255,7 @@ function Index({ session }: { session: { wallet: string; username: string } }) {
         </div>
       </div>
 
-      <AccountDrawer open={drawer === "account"} onClose={() => setDrawer(null)} />
+      <AccountDrawer open={drawer === "account"} onClose={() => setDrawer(null)} session={session} />
       <HistoryDrawer open={drawer === "history"} onClose={() => setDrawer(null)} />
       <LeaderboardDrawer open={drawer === "lb"} onClose={() => setDrawer(null)} />
     </div>
