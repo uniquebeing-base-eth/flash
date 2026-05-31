@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { User, History, Trophy, ChevronDown, TrendingUp, TrendingDown, Shuffle, Eye, Info, Zap } from "lucide-react";
 import { MARKETS, type Market } from "@/components/flash/markets";
 import { Chart } from "@/components/flash/Chart";
@@ -9,7 +9,6 @@ import { LeaderboardDrawer } from "@/components/flash/LeaderboardDrawer";
 import { UsernameGate } from "@/components/flash/UsernameGate";
 import { useLiveMarket } from "@/lib/marketData";
 import { getVaultBalance, FLASH_VAULT_ADDRESS } from "@/lib/flashVault";
-import { useEffect } from "react";
 
 export const Route = createFileRoute("/")({
   head: () => ({
