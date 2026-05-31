@@ -222,14 +222,3 @@ function SettingsTab() {
     </div>
   );
 }
-
-function Select({ value, onChange, options }: { value: string; onChange: (v: string) => void; options: string[] }) {
-  return (
-    <div className="box-sm relative">
-      <select value={value} onChange={(e) => onChange(e.target.value)} className="w-full appearance-none bg-transparent px-4 py-3 font-bold text-sm pr-8 outline-none">
-        {options.map(o => <option key={o}>{o}</option>)}
-      </select>
-      <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 pointer-events-none" />
-    </div>
-  );
-}
