@@ -4,11 +4,17 @@ import { User, ChevronDown, TrendingUp, TrendingDown, Loader2, ExternalLink } fr
 import { toast } from "sonner";
 import {
   FLASH_VAULT_ADDRESS,
-  depositCusd,
   withdrawCusd,
   getVaultBalance,
   getWalletCusdBalance,
 } from "@/lib/flashVault";
+import {
+  bridgeDeposit,
+  quoteDeposit,
+  SQUID_INTEGRATOR_ID,
+  FLASH_TREASURY_ARB,
+  type BridgeQuote,
+} from "@/lib/squidBridge";
 
 interface Session { wallet: string; username: string; }
 
@@ -36,6 +42,8 @@ function WalletTab({ session }: { session: Session }) {
   const [vaultBal, setVaultBal] = useState("0");
   const [walletBal, setWalletBal] = useState("0");
   const [lastTx, setLastTx] = useState<string | null>(null);
+  const [quote, setQuote] = useState<BridgeQuote | null>(null);
+  const [quoting, setQuoting] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -54,19 +62,53 @@ function WalletTab({ session }: { session: Session }) {
   const num = parseFloat(amount || "0");
   const valid = num > 0 && num <= parseFloat(max || "0");
 
+  // Debounced Squid quote on deposit amount changes
+  useEffect(() => {
+    if (mode !== "deposit" || !valid || !SQUID_INTEGRATOR_ID || !FLASH_TREASURY_ARB) {
+      setQuote(null);
+      return;
+    }
+    setQuoting(true);
+    const t = setTimeout(async () => {
+      try {
+        const q = await quoteDeposit(amount);
+        setQuote(q);
+      } catch {
+        setQuote(null);
+      } finally {
+        setQuoting(false);
+      }
+    }, 500);
+    return () => clearTimeout(t);
+  }, [amount, mode, valid]);
+
   const submit = async () => {
-    if (!FLASH_VAULT_ADDRESS) { toast.error("Vault not deployed yet. Deploy FlashVault.sol and set VITE_FLASH_VAULT_ADDRESS."); return; }
     if (!valid) return;
+    if (mode === "deposit" && (!SQUID_INTEGRATOR_ID || !FLASH_TREASURY_ARB)) {
+      toast.error("Bridge not configured. Set VITE_SQUID_INTEGRATOR_ID and VITE_FLASH_TREASURY_ARB.");
+      return;
+    }
+    if (mode === "withdraw" && !FLASH_VAULT_ADDRESS) {
+      toast.error("Withdrawals require the treasury server (coming soon).");
+      return;
+    }
     setBusy(true);
     setLastTx(null);
     try {
-      toast.loading(mode === "deposit" ? "Depositing cUSD…" : "Withdrawing cUSD…", { id: "vtx" });
+      toast.loading(
+        mode === "deposit" ? "Bridging cUSD → Arbitrum USDC…" : "Withdrawing cUSD…",
+        { id: "vtx" }
+      );
       const isMax = num === parseFloat(max);
-      const hash = mode === "deposit"
-        ? await depositCusd(amount)
-        : await withdrawCusd(isMax ? "max" : amount);
+      const hash =
+        mode === "deposit"
+          ? await bridgeDeposit(amount)
+          : await withdrawCusd(isMax ? "max" : amount);
       setLastTx(hash);
-      toast.success(mode === "deposit" ? "Deposited" : "Withdrawn", { id: "vtx" });
+      toast.success(
+        mode === "deposit" ? "Bridge submitted — funds en route to Arbitrum" : "Withdrawn",
+        { id: "vtx" }
+      );
       setAmount("");
       await refresh();
     } catch (e: unknown) {
@@ -123,23 +165,49 @@ function WalletTab({ session }: { session: Session }) {
         className={`box w-full font-display text-lg py-4 flex items-center justify-center gap-2 disabled:opacity-50 ${mode === "deposit" ? "bg-[color:var(--profit)] text-white" : "bg-[color:var(--yellow-accent)]"}`}
       >
         {busy ? <Loader2 className="w-5 h-5 animate-spin" /> : mode === "deposit" ? <TrendingUp className="w-5 h-5" /> : <TrendingDown className="w-5 h-5" />}
-        {busy ? "PROCESSING…" : mode === "deposit" ? "DEPOSIT cUSD" : "WITHDRAW cUSD"}
+        {busy ? "PROCESSING…" : mode === "deposit" ? "BRIDGE TO ARBITRUM" : "WITHDRAW cUSD"}
       </button>
 
+      {mode === "deposit" && valid && (
+        <div className="box-sm p-3 text-xs space-y-1">
+          <div className="flex justify-between">
+            <span className="text-muted-foreground">You receive</span>
+            <span className="font-mono">{quoting ? "…" : quote ? `${quote.toAmount} USDC` : "—"}</span>
+          </div>
+          <div className="flex justify-between">
+            <span className="text-muted-foreground">Min received</span>
+            <span className="font-mono">{quote ? `${quote.toAmountMin} USDC` : "—"}</span>
+          </div>
+          <div className="flex justify-between">
+            <span className="text-muted-foreground">ETA</span>
+            <span className="font-mono">{quote ? `~${Math.max(1, Math.round(quote.estimatedRouteDuration / 60))} min` : "—"}</span>
+          </div>
+          <div className="flex justify-between">
+            <span className="text-muted-foreground">Route</span>
+            <span>Celo cUSD → Arbitrum USDC</span>
+          </div>
+        </div>
+      )}
+
       {lastTx && (
-        <a href={`https://celoscan.io/tx/${lastTx}`} target="_blank" rel="noreferrer" className="flex items-center justify-center gap-1 text-xs text-[color:var(--cyan-accent)] font-bold">
-          View transaction <ExternalLink className="w-3 h-3" />
+        <a
+          href={mode === "deposit" ? `https://axelarscan.io/gmp/${lastTx}` : `https://celoscan.io/tx/${lastTx}`}
+          target="_blank"
+          rel="noreferrer"
+          className="flex items-center justify-center gap-1 text-xs text-[color:var(--cyan-accent)] font-bold"
+        >
+          {mode === "deposit" ? "Track on Axelarscan" : "View transaction"} <ExternalLink className="w-3 h-3" />
         </a>
       )}
 
-      {!FLASH_VAULT_ADDRESS && (
+      {(!SQUID_INTEGRATOR_ID || !FLASH_TREASURY_ARB) && (
         <div className="border-t border-dashed pt-3 text-xs text-[color:var(--loss)] leading-relaxed">
-          ⚠ FlashVault contract not deployed. Deploy <span className="font-mono">contracts/FlashVault.sol</span> with constructor arg <span className="font-mono">0x765DE816845861e75A25fCA122bb6898B8B1282a</span> (cUSD), then set <span className="font-mono">VITE_FLASH_VAULT_ADDRESS</span>.
+          ⚠ Bridge not configured. Set <span className="font-mono">VITE_SQUID_INTEGRATOR_ID</span> (from app.squidrouter.com) and <span className="font-mono">VITE_FLASH_TREASURY_ARB</span> (your Arbitrum treasury wallet) in <span className="font-mono">.env</span>.
         </div>
       )}
 
       <div className="border-t border-dashed pt-3 text-xs text-muted-foreground leading-relaxed">
-        Non-custodial cUSD vault on Celo. Only you can withdraw your balance. ~$0.001 gas per tx.
+        Powered by Squid Router. Deposits bridge cUSD on Celo → USDC on Arbitrum into the Flash treasury, which funds your Hyperliquid perp account. One signature, ~1–3 min settlement.
       </div>
     </div>
   );
