@@ -28,6 +28,23 @@ async function loadYahooChart(symbol: string, interval: string, range: string) {
   };
 }
 
+function aggregateCandles(candles: CandleDto[], bucketMs: number): CandleDto[] {
+  const grouped = new Map<number, CandleDto>();
+  for (const candle of candles) {
+    const t = Math.floor(candle.t / bucketMs) * bucketMs;
+    const current = grouped.get(t);
+    if (!current) {
+      grouped.set(t, { ...candle, t });
+    } else {
+      current.h = Math.max(current.h, candle.h);
+      current.l = Math.min(current.l, candle.l);
+      current.c = candle.c;
+      current.v += candle.v;
+    }
+  }
+  return Array.from(grouped.values()).sort((a, b) => a.t - b.t);
+}
+
 /**
  * Fetch real OHLC candles from Yahoo Finance for forex / commodities.
  * Server-side proxy avoids browser CORS issues with query1.finance.yahoo.com.
@@ -47,10 +64,11 @@ export const fetchYahooCandles = createServerFn({ method: "GET" })
       if (o == null || h == null || l == null || c == null) continue;
       out.push({ t: r.timestamp[i] * 1000, o, h, l, c, v: q.volume?.[i] ?? 0 });
     }
+    const candles = timeframe === "4h" ? aggregateCandles(out, 14_400_000) : out;
     const price = Number(r.meta?.regularMarketPrice ?? out.at(-1)?.c ?? 0);
     const previous = Number(r.meta?.previousClose ?? r.meta?.chartPreviousClose ?? out.at(-2)?.c ?? price);
     const change24h = previous ? ((price - previous) / previous) * 100 : 0;
-    return { candles: out.slice(-60), price, change24h };
+    return { candles: candles.slice(-60), price, change24h };
   });
 
 export const fetchYahooSnapshots = createServerFn({ method: "GET" })
