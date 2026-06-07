@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import { fetchYahooCandles } from "@/lib/marketCandles.functions";
+import { fetchYahooCandles, fetchYahooSnapshots } from "@/lib/marketCandles.functions";
 
 export interface Candle { t: number; o: number; h: number; l: number; c: number; v: number; }
+export interface MarketSnapshot { price: number; change24h: number; }
 
 const TF_TO_MS: Record<string, number> = {
   "1m": 60_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
@@ -30,7 +31,7 @@ function seededCandles(seed: number, basePrice: number, tfMs: number, count: num
 /**
  * Live OHLC + last price.
  * - For Binance-mapped markets: REST seed + WebSocket kline stream (real data).
- * - For Forex / Commodities: deterministic simulation with a live wiggle.
+ * - For Forex / Commodities: Yahoo OHLC + live last-price polling.
  */
 export function useLiveMarket(binanceSymbol: string | undefined, fallbackSeed: string, basePrice: number, timeframe: string) {
   return useLiveMarketV2({ binance: binanceSymbol, yahoo: undefined, fallbackSeed, basePrice, timeframe });
@@ -47,6 +48,7 @@ interface LiveMarketArgs {
 export function useLiveMarketV2({ binance: binanceSymbol, yahoo: yahooSymbol, fallbackSeed, basePrice, timeframe }: LiveMarketArgs) {
   const [candles, setCandles] = useState<Candle[]>([]);
   const [price, setPrice] = useState<number>(basePrice);
+  const [change24h, setChange24h] = useState<number>(0);
   const wsRef = useRef<WebSocket | null>(null);
   const tfMs = TF_TO_MS[timeframe] ?? 60_000;
 
@@ -55,6 +57,20 @@ export function useLiveMarketV2({ binance: binanceSymbol, yahoo: yahooSymbol, fa
     setCandles([]);
 
     if (binanceSymbol) {
+      const updateTicker = async () => {
+        try {
+          const r = await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${binanceSymbol}`);
+          const row = await r.json();
+          if (cancelled) return;
+          const last = Number(row.lastPrice);
+          const change = Number(row.priceChangePercent);
+          if (Number.isFinite(last)) setPrice(last);
+          if (Number.isFinite(change)) setChange24h(change);
+        } catch { /* keep kline price */ }
+      };
+      updateTicker();
+      const tickerId = setInterval(updateTicker, 5000);
+
       // 1) seed with real REST klines
       fetch(`https://api.binance.com/api/v3/klines?symbol=${binanceSymbol}&interval=${timeframe}&limit=60`)
         .then(r => r.json())
@@ -107,7 +123,7 @@ export function useLiveMarketV2({ binance: binanceSymbol, yahoo: yahooSymbol, fa
           });
         } catch { /* ignore */ }
       };
-      return () => { cancelled = true; ws.close(); };
+      return () => { cancelled = true; clearInterval(tickerId); ws.close(); };
     }
 
     // Yahoo Finance path (Forex / Commodities) — poll real OHLC every 20s.
@@ -127,9 +143,20 @@ export function useLiveMarketV2({ binance: binanceSymbol, yahoo: yahooSymbol, fa
           setPrice(sim[sim.length - 1].c);
         }
       };
+      const updateSnapshot = async () => {
+        try {
+          const { snapshots } = await fetchYahooSnapshots({ data: { symbols: [yahooSymbol] } });
+          const snapshot = snapshots[yahooSymbol];
+          if (cancelled || !snapshot) return;
+          if (Number.isFinite(snapshot.price) && snapshot.price > 0) setPrice(snapshot.price);
+          if (Number.isFinite(snapshot.change24h)) setChange24h(snapshot.change24h);
+        } catch { /* keep candle close */ }
+      };
       load();
-      const id = setInterval(load, 20_000);
-      return () => { cancelled = true; clearInterval(id); };
+      updateSnapshot();
+      const candleId = setInterval(load, 20_000);
+      const tickerId = setInterval(updateSnapshot, 5000);
+      return () => { cancelled = true; clearInterval(candleId); clearInterval(tickerId); };
     }
 
     // Simulated path (no live source mapped)
@@ -161,5 +188,44 @@ export function useLiveMarketV2({ binance: binanceSymbol, yahoo: yahooSymbol, fa
     return () => { cancelled = true; clearInterval(id); };
   }, [binanceSymbol, yahooSymbol, fallbackSeed, basePrice, timeframe, tfMs]);
 
-  return { candles, price };
+  return { candles, price, change24h };
+}
+
+export function useMarketSnapshots(markets: { binance?: string; yahoo?: string; price: number; change24h: number }[]) {
+  const [snapshots, setSnapshots] = useState<Record<number, MarketSnapshot>>({});
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      const next: Record<number, MarketSnapshot> = {};
+      await Promise.all([
+        Promise.all(markets.map(async (m, idx) => {
+          if (!m.binance) return;
+          try {
+            const r = await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${m.binance}`);
+            const row = await r.json();
+            const price = Number(row.lastPrice);
+            const change24h = Number(row.priceChangePercent);
+            if (Number.isFinite(price)) next[idx] = { price, change24h: Number.isFinite(change24h) ? change24h : m.change24h };
+          } catch { /* keep fallback */ }
+        })),
+        (async () => {
+          const yahooSymbols = markets.map((m) => m.yahoo).filter((s): s is string => !!s);
+          if (!yahooSymbols.length) return;
+          try {
+            const { snapshots: yahooSnapshots } = await fetchYahooSnapshots({ data: { symbols: yahooSymbols } });
+            markets.forEach((m, idx) => {
+              if (m.yahoo && yahooSnapshots[m.yahoo]) next[idx] = yahooSnapshots[m.yahoo];
+            });
+          } catch { /* keep fallback */ }
+        })(),
+      ]);
+      if (!cancelled) setSnapshots(next);
+    };
+    load();
+    const id = setInterval(load, 10_000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [markets]);
+
+  return snapshots;
 }
