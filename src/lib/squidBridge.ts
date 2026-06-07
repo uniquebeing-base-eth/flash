@@ -18,8 +18,6 @@ export const USDC_ARB = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831";
 
 export const SQUID_INTEGRATOR_ID =
   (import.meta.env.VITE_SQUID_INTEGRATOR_ID as string | undefined) ?? "";
-export const FLASH_TREASURY_ARB =
-  (import.meta.env.VITE_FLASH_TREASURY_ARB as string | undefined) ?? "";
 
 let _squid: Squid | null = null;
 async function getSquid(): Promise<Squid> {
@@ -63,7 +61,7 @@ export async function quoteDeposit(amountCusdHuman: string): Promise<BridgeQuote
     fromAmount: parseUnits(amountCusdHuman, 18).toString(),
     toChain: ARBITRUM_CHAIN_ID,
     toToken: USDC_ARB,
-    toAddress: FLASH_TREASURY_ARB || fromAddress,
+    toAddress: fromAddress,
   });
 
   const est = route.estimate;
@@ -81,9 +79,6 @@ export async function quoteDeposit(amountCusdHuman: string): Promise<BridgeQuote
  * Returns the source-chain tx hash (trackable on Axelarscan).
  */
 export async function bridgeDeposit(amountCusdHuman: string): Promise<string> {
-  if (!FLASH_TREASURY_ARB) {
-    throw new Error("Treasury not configured. Set VITE_FLASH_TREASURY_ARB.");
-  }
   const squid = await getSquid();
   const provider = getBrowserProvider();
   const signer = await provider.getSigner();
@@ -97,7 +92,7 @@ export async function bridgeDeposit(amountCusdHuman: string): Promise<string> {
     fromAmount,
     toChain: ARBITRUM_CHAIN_ID,
     toToken: USDC_ARB,
-    toAddress: FLASH_TREASURY_ARB,
+    toAddress: fromAddress,
   });
 
   if (!route.transactionRequest || !("target" in route.transactionRequest)) {

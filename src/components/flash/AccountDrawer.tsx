@@ -12,7 +12,6 @@ import {
   bridgeDeposit,
   quoteDeposit,
   SQUID_INTEGRATOR_ID,
-  FLASH_TREASURY_ARB,
   type BridgeQuote,
 } from "@/lib/squidBridge";
 
@@ -64,7 +63,7 @@ function WalletTab({ session }: { session: Session }) {
 
   // Debounced Squid quote on deposit amount changes
   useEffect(() => {
-    if (mode !== "deposit" || !valid || !SQUID_INTEGRATOR_ID || !FLASH_TREASURY_ARB) {
+    if (mode !== "deposit" || !valid || !SQUID_INTEGRATOR_ID) {
       setQuote(null);
       return;
     }
@@ -84,8 +83,8 @@ function WalletTab({ session }: { session: Session }) {
 
   const submit = async () => {
     if (!valid) return;
-    if (mode === "deposit" && (!SQUID_INTEGRATOR_ID || !FLASH_TREASURY_ARB)) {
-      toast.error("Bridge not configured. Set VITE_SQUID_INTEGRATOR_ID and VITE_FLASH_TREASURY_ARB.");
+    if (mode === "deposit" && !SQUID_INTEGRATOR_ID) {
+      toast.error("Bridge not configured. Set VITE_SQUID_INTEGRATOR_ID.");
       return;
     }
     if (mode === "withdraw" && !FLASH_VAULT_ADDRESS) {
@@ -200,14 +199,14 @@ function WalletTab({ session }: { session: Session }) {
         </a>
       )}
 
-      {(!SQUID_INTEGRATOR_ID || !FLASH_TREASURY_ARB) && (
+      {!SQUID_INTEGRATOR_ID && (
         <div className="border-t border-dashed pt-3 text-xs text-[color:var(--loss)] leading-relaxed">
-          ⚠ Bridge not configured. Set <span className="font-mono">VITE_SQUID_INTEGRATOR_ID</span> (from app.squidrouter.com) and <span className="font-mono">VITE_FLASH_TREASURY_ARB</span> (your Arbitrum treasury wallet) in <span className="font-mono">.env</span>.
+          ⚠ Bridge not configured. Set <span className="font-mono">VITE_SQUID_INTEGRATOR_ID</span> (from app.squidrouter.com) in <span className="font-mono">.env</span>.
         </div>
       )}
 
       <div className="border-t border-dashed pt-3 text-xs text-muted-foreground leading-relaxed">
-        Powered by Squid Router. Deposits bridge cUSD on Celo → USDC on Arbitrum into the Flash treasury, which funds your Hyperliquid perp account. One signature, ~1–3 min settlement.
+        Powered by Squid Router. Deposits bridge cUSD on Celo → USDC on Arbitrum into your own wallet — used as collateral for GMX v2 perps. Non-custodial, one signature, ~1–3 min settlement.
       </div>
     </div>
   );
