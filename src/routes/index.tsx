@@ -61,7 +61,9 @@ function Index({ session }: { session: { wallet: string; username: string } }) {
     basePrice: market.price,
     timeframe,
   });
-  const selectedChange24h = Number.isFinite(liveChange24h) ? liveChange24h : (marketSnapshots[marketIdx]?.change24h ?? market.change24h);
+  const selectedChange24h = typeof liveChange24h === "number" && Number.isFinite(liveChange24h)
+    ? liveChange24h
+    : (marketSnapshots[marketIdx]?.change24h ?? market.change24h);
 
   const sizeUsd = +(balance * (sizePct / 100) * leverage || 1).toFixed(2);
   const margin = +(sizeUsd / leverage).toFixed(2);
