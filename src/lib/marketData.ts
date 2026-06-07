@@ -130,10 +130,11 @@ export function useLiveMarketV2({ binance: binanceSymbol, yahoo: yahooSymbol, fa
     if (yahooSymbol) {
       const load = async () => {
         try {
-          const { candles: rows } = await fetchYahooCandles({ data: { symbol: yahooSymbol, timeframe } });
+          const { candles: rows, price: lastPrice, change24h: dayChange } = await fetchYahooCandles({ data: { symbol: yahooSymbol, timeframe } });
           if (cancelled || !rows.length) return;
           setCandles(rows);
-          setPrice(rows[rows.length - 1].c);
+          setPrice(lastPrice || rows[rows.length - 1].c);
+          setChange24h(dayChange);
         } catch {
           // fall through to simulation below on first failure only
           if (cancelled) return;
