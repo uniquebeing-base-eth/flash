@@ -7,7 +7,7 @@ import { AccountDrawer } from "@/components/flash/AccountDrawer";
 import { HistoryDrawer } from "@/components/flash/HistoryDrawer";
 import { LeaderboardDrawer } from "@/components/flash/LeaderboardDrawer";
 import { UsernameGate } from "@/components/flash/UsernameGate";
-import { useLiveMarket } from "@/lib/marketData";
+import { useLiveMarketV2 } from "@/lib/marketData";
 import { getVaultBalance, FLASH_VAULT_ADDRESS } from "@/lib/flashVault";
 
 export const Route = createFileRoute("/")({
@@ -53,7 +53,13 @@ function Index({ session }: { session: { wallet: string; username: string } }) {
 
   const market = MARKETS[marketIdx];
 
-  const { candles, price: livePrice } = useLiveMarket(market.binance, market.symbol, market.price, timeframe);
+  const { candles, price: livePrice } = useLiveMarketV2({
+    binance: market.binance,
+    yahoo: market.yahoo,
+    fallbackSeed: market.symbol,
+    basePrice: market.price,
+    timeframe,
+  });
 
   const sizeUsd = +(balance * (sizePct / 100) * leverage || 1).toFixed(2);
   const margin = +(sizeUsd / leverage).toFixed(2);
@@ -141,7 +147,7 @@ function Index({ session }: { session: { wallet: string; username: string } }) {
           price={livePrice}
           entryPrice={position?.entry}
           liqPrice={position ? (position.dir === "LONG" ? liqL : liqS) : undefined}
-          isLive={!!market.binance}
+            isLive={!!(market.binance || market.yahoo)}
         />
 
         {/* TIMEFRAMES */}

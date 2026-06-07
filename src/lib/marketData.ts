@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { fetchYahooCandles } from "@/lib/marketCandles.functions";
 
 export interface Candle { t: number; o: number; h: number; l: number; c: number; v: number; }
 
@@ -32,6 +33,18 @@ function seededCandles(seed: number, basePrice: number, tfMs: number, count: num
  * - For Forex / Commodities: deterministic simulation with a live wiggle.
  */
 export function useLiveMarket(binanceSymbol: string | undefined, fallbackSeed: string, basePrice: number, timeframe: string) {
+  return useLiveMarketV2({ binance: binanceSymbol, yahoo: undefined, fallbackSeed, basePrice, timeframe });
+}
+
+interface LiveMarketArgs {
+  binance?: string;
+  yahoo?: string;
+  fallbackSeed: string;
+  basePrice: number;
+  timeframe: string;
+}
+
+export function useLiveMarketV2({ binance: binanceSymbol, yahoo: yahooSymbol, fallbackSeed, basePrice, timeframe }: LiveMarketArgs) {
   const [candles, setCandles] = useState<Candle[]>([]);
   const [price, setPrice] = useState<number>(basePrice);
   const wsRef = useRef<WebSocket | null>(null);
@@ -97,7 +110,29 @@ export function useLiveMarket(binanceSymbol: string | undefined, fallbackSeed: s
       return () => { cancelled = true; ws.close(); };
     }
 
-    // Simulated path (Forex / Commodities — no free public WS)
+    // Yahoo Finance path (Forex / Commodities) — poll real OHLC every 20s.
+    if (yahooSymbol) {
+      const load = async () => {
+        try {
+          const { candles: rows } = await fetchYahooCandles({ data: { symbol: yahooSymbol, timeframe } });
+          if (cancelled || !rows.length) return;
+          setCandles(rows);
+          setPrice(rows[rows.length - 1].c);
+        } catch {
+          // fall through to simulation below on first failure only
+          if (cancelled) return;
+          const seed = fallbackSeed.split("").reduce((a, c) => a + c.charCodeAt(0), 0);
+          const sim = seededCandles(seed, basePrice, tfMs, 60);
+          setCandles(sim);
+          setPrice(sim[sim.length - 1].c);
+        }
+      };
+      load();
+      const id = setInterval(load, 20_000);
+      return () => { cancelled = true; clearInterval(id); };
+    }
+
+    // Simulated path (no live source mapped)
     const seed = fallbackSeed.split("").reduce((a, c) => a + c.charCodeAt(0), 0);
     const sim = seededCandles(seed, basePrice, tfMs, 60);
     setCandles(sim);
@@ -124,7 +159,7 @@ export function useLiveMarket(binanceSymbol: string | undefined, fallbackSeed: s
       });
     }, 1200);
     return () => { cancelled = true; clearInterval(id); };
-  }, [binanceSymbol, fallbackSeed, basePrice, timeframe, tfMs]);
+  }, [binanceSymbol, yahooSymbol, fallbackSeed, basePrice, timeframe, tfMs]);
 
   return { candles, price };
 }
