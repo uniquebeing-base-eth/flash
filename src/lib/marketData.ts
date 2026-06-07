@@ -55,6 +55,8 @@ export function useLiveMarketV2({ binance: binanceSymbol, yahoo: yahooSymbol, fa
   useEffect(() => {
     let cancelled = false;
     setCandles([]);
+    setPrice(basePrice);
+    setChange24h(undefined);
 
     if (binanceSymbol) {
       const updateTicker = async () => {
