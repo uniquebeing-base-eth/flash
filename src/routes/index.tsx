@@ -7,7 +7,7 @@ import { AccountDrawer } from "@/components/flash/AccountDrawer";
 import { HistoryDrawer } from "@/components/flash/HistoryDrawer";
 import { LeaderboardDrawer } from "@/components/flash/LeaderboardDrawer";
 import { UsernameGate } from "@/components/flash/UsernameGate";
-import { useLiveMarketV2 } from "@/lib/marketData";
+import { useLiveMarketV2, useMarketSnapshots } from "@/lib/marketData";
 import { getVaultBalance, FLASH_VAULT_ADDRESS } from "@/lib/flashVault";
 
 export const Route = createFileRoute("/")({
@@ -53,13 +53,17 @@ function Index({ session }: { session: { wallet: string; username: string } }) {
 
   const market = MARKETS[marketIdx];
 
-  const { candles, price: livePrice } = useLiveMarketV2({
+  const marketSnapshots = useMarketSnapshots(MARKETS);
+  const { candles, price: livePrice, change24h: liveChange24h } = useLiveMarketV2({
     binance: market.binance,
     yahoo: market.yahoo,
     fallbackSeed: market.symbol,
     basePrice: market.price,
     timeframe,
   });
+  const selectedChange24h = typeof liveChange24h === "number" && Number.isFinite(liveChange24h)
+    ? liveChange24h
+    : (marketSnapshots[marketIdx]?.change24h ?? market.change24h);
 
   const sizeUsd = +(balance * (sizePct / 100) * leverage || 1).toFixed(2);
   const margin = +(sizeUsd / leverage).toFixed(2);
@@ -107,8 +111,8 @@ function Index({ session }: { session: { wallet: string; username: string } }) {
             <div className="flex items-center gap-2">
               <span className="w-6 h-6 rounded-full bg-foreground text-background grid place-items-center text-xs font-bold">{market.icon}</span>
               <span className="font-bold text-sm">${livePrice.toLocaleString()}</span>
-              <span className={`text-xs font-bold ${market.change24h >= 0 ? "text-[color:var(--profit)]" : "text-[color:var(--loss)]"}`}>
-                {market.change24h >= 0 ? "+" : ""}{market.change24h}%
+              <span className={`text-xs font-bold ${selectedChange24h >= 0 ? "text-[color:var(--profit)]" : "text-[color:var(--loss)]"}`}>
+                {selectedChange24h >= 0 ? "+" : ""}{selectedChange24h.toFixed(2)}%
               </span>
             </div>
             <ChevronDown className={`w-4 h-4 transition ${marketOpen ? "rotate-180" : ""}`} />
@@ -123,6 +127,9 @@ function Index({ session }: { session: { wallet: string; username: string } }) {
                 <div className="px-3 py-1 text-[10px] uppercase tracking-wider text-muted-foreground bg-muted border-b border-foreground">{cat}</div>
                 {MARKETS.filter(m => m.category === cat).map((m: Market, _i) => {
                   const idx = MARKETS.indexOf(m);
+                  const snapshot = marketSnapshots[idx];
+                  const rowPrice = snapshot?.price ?? m.price;
+                  const rowChange = snapshot?.change24h ?? m.change24h;
                   return (
                     <button key={m.symbol} onClick={() => { setMarketIdx(idx); setMarketOpen(false); }} className={`w-full px-3 py-2 flex items-center justify-between border-b border-foreground/10 ${idx === marketIdx ? "bg-[color:var(--yellow-accent)]" : ""}`}>
                       <div className="flex items-center gap-2">
@@ -130,8 +137,8 @@ function Index({ session }: { session: { wallet: string; username: string } }) {
                         <span className="font-bold text-sm">{m.symbol}</span>
                       </div>
                       <div className="text-right">
-                        <div className="text-xs font-mono">${m.price.toLocaleString()}</div>
-                        <div className={`text-[10px] ${m.change24h >= 0 ? "text-[color:var(--profit)]" : "text-[color:var(--loss)]"}`}>{m.change24h >= 0 ? "+" : ""}{m.change24h}%</div>
+                        <div className="text-xs font-mono">${rowPrice.toLocaleString(undefined, { maximumFractionDigits: rowPrice >= 10 ? 2 : 5 })}</div>
+                        <div className={`text-[10px] ${rowChange >= 0 ? "text-[color:var(--profit)]" : "text-[color:var(--loss)]"}`}>{rowChange >= 0 ? "+" : ""}{rowChange.toFixed(2)}%</div>
                       </div>
                     </button>
                   );
@@ -147,7 +154,7 @@ function Index({ session }: { session: { wallet: string; username: string } }) {
           price={livePrice}
           entryPrice={position?.entry}
           liqPrice={position ? (position.dir === "LONG" ? liqL : liqS) : undefined}
-            isLive={!!(market.binance || market.yahoo)}
+          isLive={!!(market.binance || market.yahoo)}
         />
 
         {/* TIMEFRAMES */}

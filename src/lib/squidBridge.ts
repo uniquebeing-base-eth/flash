@@ -1,14 +1,11 @@
-import { Squid } from "@0xsquid/sdk";
 import { BrowserProvider, Contract, parseUnits, MaxUint256 } from "ethers";
 
 /**
  * Squid Router bridge: Celo cUSD -> Arbitrum USDC.
  *
- * Why: Hyperliquid (and most perp venues) settle in USDC on Arbitrum.
+ * Why: GMX v2 perps use USDC collateral on Arbitrum.
  * MiniPay users hold cUSD on Celo, so every deposit is bridged in one
- * signed tx into the Flash treasury on Arbitrum, which funds the
- * trading sub-account off-chain. Withdrawals are the reverse leg,
- * signed by the treasury server-side (not implemented here).
+ * signed tx into the user's own Arbitrum wallet for non-custodial trading.
  */
 
 export const CELO_CHAIN_ID = "42220";
@@ -19,19 +16,40 @@ export const USDC_ARB = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831";
 export const SQUID_INTEGRATOR_ID =
   (import.meta.env.VITE_SQUID_INTEGRATOR_ID as string | undefined) ?? "";
 
-let _squid: Squid | null = null;
-async function getSquid(): Promise<Squid> {
-  if (_squid) return _squid;
+interface SquidRouteResponse {
+  route: {
+    estimate: {
+      toAmount: string;
+      toAmountMin: string;
+      estimatedRouteDuration?: number | string;
+      aggregatePriceImpact?: number | string;
+    };
+    transactionRequest?: {
+      target?: string;
+      data?: string;
+      value?: string;
+    };
+  };
+}
+
+async function getSquidRoute(params: Record<string, string | number | boolean>): Promise<SquidRouteResponse> {
   if (!SQUID_INTEGRATOR_ID) {
     throw new Error("Missing VITE_SQUID_INTEGRATOR_ID. Get one at app.squidrouter.com.");
   }
-  const sdk = new Squid({
-    baseUrl: "https://v2.api.squidrouter.com",
-    integratorId: SQUID_INTEGRATOR_ID,
+  const res = await fetch("https://v2.api.squidrouter.com/v2/route", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-integrator-id": SQUID_INTEGRATOR_ID,
+    },
+    body: JSON.stringify(params),
   });
-  await sdk.init();
-  _squid = sdk;
-  return sdk;
+  const json = await res.json().catch(() => null) as (SquidRouteResponse & { error?: unknown }) | null;
+  if (!res.ok || !json?.route) {
+    const error = typeof json?.error === "string" ? json.error : `Squid route failed (${res.status})`;
+    throw new Error(error);
+  }
+  return json;
 }
 
 function getBrowserProvider(): BrowserProvider {
@@ -49,12 +67,11 @@ export interface BridgeQuote {
 }
 
 export async function quoteDeposit(amountCusdHuman: string): Promise<BridgeQuote> {
-  const squid = await getSquid();
   const provider = getBrowserProvider();
   const signer = await provider.getSigner();
   const fromAddress = await signer.getAddress();
 
-  const { route } = await squid.getRoute({
+  const { route } = await getSquidRoute({
     fromAddress,
     fromChain: CELO_CHAIN_ID,
     fromToken: CUSD_CELO,
@@ -69,23 +86,22 @@ export async function quoteDeposit(amountCusdHuman: string): Promise<BridgeQuote
     toAmount: (Number(est.toAmount) / 1e6).toFixed(4),
     toAmountMin: (Number(est.toAmountMin) / 1e6).toFixed(4),
     estimatedRouteDuration: Number(est.estimatedRouteDuration ?? 0),
-    feeUsd: est.aggregatePriceImpact ?? "0",
+    feeUsd: String(est.aggregatePriceImpact ?? "0"),
   };
 }
 
 /**
- * Bridge cUSD on Celo -> USDC on Arbitrum into the Flash treasury.
+ * Bridge cUSD on Celo -> USDC on Arbitrum into the user's own wallet.
  * Approves cUSD spend if needed, then submits the Squid swap tx.
  * Returns the source-chain tx hash (trackable on Axelarscan).
  */
 export async function bridgeDeposit(amountCusdHuman: string): Promise<string> {
-  const squid = await getSquid();
   const provider = getBrowserProvider();
   const signer = await provider.getSigner();
   const fromAddress = await signer.getAddress();
   const fromAmount = parseUnits(amountCusdHuman, 18).toString();
 
-  const { route } = await squid.getRoute({
+  const { route } = await getSquidRoute({
     fromAddress,
     fromChain: CELO_CHAIN_ID,
     fromToken: CUSD_CELO,
@@ -95,10 +111,10 @@ export async function bridgeDeposit(amountCusdHuman: string): Promise<string> {
     toAddress: fromAddress,
   });
 
-  if (!route.transactionRequest || !("target" in route.transactionRequest)) {
+  if (!route.transactionRequest?.target || !route.transactionRequest.data) {
     throw new Error("Squid returned no executable transaction request.");
   }
-  const target = route.transactionRequest.target as string;
+  const target = route.transactionRequest.target;
 
   // Approve Squid router to pull cUSD (max approval — saves gas on subsequent deposits)
   const erc20Abi = [
@@ -112,9 +128,12 @@ export async function bridgeDeposit(amountCusdHuman: string): Promise<string> {
     await tx.wait();
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const txResponse: any = await squid.executeRoute({ signer: signer as any, route });
-  const hash: string = txResponse?.hash ?? txResponse?.transactionHash ?? "";
-  if (txResponse?.wait) await txResponse.wait();
-  return hash;
+  const tx = await signer.sendTransaction({
+    to: target,
+    data: route.transactionRequest.data,
+    value: route.transactionRequest.value ?? "0",
+    chainId: Number(CELO_CHAIN_ID),
+  });
+  await tx.wait();
+  return tx.hash;
 }
