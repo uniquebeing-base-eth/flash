@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback } from "react";
 import { Drawer } from "./Drawer";
 import { User, ChevronDown, TrendingUp, TrendingDown, Loader2, ExternalLink } from "lucide-react";
 import { toast } from "sonner";
-import { getVaultBalance, getWalletCusdBalance } from "@/lib/flashVault";
+import { getWalletCusdBalance } from "@/lib/flashVault";
 import {
   bridgeDeposit,
   quoteDeposit,
@@ -42,7 +42,6 @@ function WalletTab({ session }: { session: Session }) {
   const [mode, setMode] = useState<"deposit" | "withdraw">("deposit");
   const [amount, setAmount] = useState("");
   const [busy, setBusy] = useState(false);
-  const [vaultBal, setVaultBal] = useState("0");
   const [walletBal, setWalletBal] = useState("0");
   const [arbUsdcBal, setArbUsdcBal] = useState("0");
   const [lastTx, setLastTx] = useState<string | null>(null);
@@ -53,12 +52,10 @@ function WalletTab({ session }: { session: Session }) {
   const [activeWithdraw, setActiveWithdraw] = useState<WithdrawRecord | null>(null);
 
   const refresh = useCallback(async () => {
-    const [v, w, a] = await Promise.allSettled([
-      getVaultBalance(session.wallet),
+    const [w, a] = await Promise.allSettled([
       getWalletCusdBalance(session.wallet),
       getArbUsdcBalance(session.wallet),
     ]);
-    if (v.status === "fulfilled") setVaultBal(v.value);
     if (w.status === "fulfilled") setWalletBal(w.value);
     if (a.status === "fulfilled") setArbUsdcBal(a.value);
   }, [session.wallet]);
