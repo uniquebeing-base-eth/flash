@@ -2,12 +2,7 @@ import { useEffect, useState, useCallback } from "react";
 import { Drawer } from "./Drawer";
 import { User, ChevronDown, TrendingUp, TrendingDown, Loader2, ExternalLink } from "lucide-react";
 import { toast } from "sonner";
-import {
-  FLASH_VAULT_ADDRESS,
-  withdrawCusd,
-  getVaultBalance,
-  getWalletCusdBalance,
-} from "@/lib/flashVault";
+import { getVaultBalance, getWalletCusdBalance } from "@/lib/flashVault";
 import {
   bridgeDeposit,
   quoteDeposit,
