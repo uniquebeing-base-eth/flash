@@ -1,4 +1,7 @@
 import { BrowserProvider, Contract, parseUnits, MaxUint256 } from "ethers";
+import { DEPOSIT_FEE_USD, CELO_FEE_TREASURY, assertCeloFeeTreasury } from "./fees";
+import { logEvent } from "./logger";
+import { withRetry } from "./rpc";
 
 /**
  * Squid Router bridge: Celo cUSD -> Arbitrum USDC.
@@ -15,6 +18,54 @@ export const USDC_ARB = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831";
 
 export const SQUID_INTEGRATOR_ID =
   (import.meta.env.VITE_SQUID_INTEGRATOR_ID as string | undefined) ?? "";
+
+/* ============================================================== */
+/* Deposit state machine — persisted in localStorage for recovery */
+/* ============================================================== */
+
+export type DepositStatus =
+  | "INITIATED"
+  | "FEE_PAID"
+  | "BRIDGING"
+  | "COMPLETED"
+  | "FAILED";
+
+export interface DepositRecord {
+  id: string;
+  wallet: string;
+  amountCusd: string;        // gross amount user typed
+  feeCusd: string;           // DEPOSIT_FEE_USD
+  netCusd: string;           // amountCusd - feeCusd
+  status: DepositStatus;
+  feeTxHash?: string;
+  bridgeTxHash?: string;
+  squidStatus?: string;
+  error?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+const STORE_KEY = "flash.deposits";
+
+function readStore(): Record<string, DepositRecord> {
+  if (typeof window === "undefined") return {};
+  try { return JSON.parse(localStorage.getItem(STORE_KEY) ?? "{}") as Record<string, DepositRecord>; }
+  catch { return {}; }
+}
+function writeStore(s: Record<string, DepositRecord>) {
+  if (typeof window === "undefined") return;
+  localStorage.setItem(STORE_KEY, JSON.stringify(s));
+}
+function upsert(rec: DepositRecord) {
+  const s = readStore();
+  s[rec.id] = { ...rec, updatedAt: Date.now() };
+  writeStore(s);
+}
+export function getDeposit(id: string): DepositRecord | undefined { return readStore()[id]; }
+export function listDeposits(wallet: string): DepositRecord[] {
+  return Object.values(readStore()).filter(d => d.wallet.toLowerCase() === wallet.toLowerCase())
+    .sort((a, b) => b.createdAt - a.createdAt);
+}
 
 interface SquidRouteResponse {
   route: {
@@ -36,20 +87,47 @@ async function getSquidRoute(params: Record<string, string | number | boolean>):
   if (!SQUID_INTEGRATOR_ID) {
     throw new Error("Missing VITE_SQUID_INTEGRATOR_ID. Get one at app.squidrouter.com.");
   }
-  const res = await fetch("https://v2.api.squidrouter.com/v2/route", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-integrator-id": SQUID_INTEGRATOR_ID,
-    },
-    body: JSON.stringify(params),
-  });
-  const json = await res.json().catch(() => null) as (SquidRouteResponse & { error?: unknown }) | null;
-  if (!res.ok || !json?.route) {
-    const error = typeof json?.error === "string" ? json.error : `Squid route failed (${res.status})`;
-    throw new Error(error);
+  return withRetry(async () => {
+    const res = await fetch("https://v2.api.squidrouter.com/v2/route", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-integrator-id": SQUID_INTEGRATOR_ID },
+      body: JSON.stringify(params),
+    });
+    const json = await res.json().catch(() => null) as (SquidRouteResponse & { error?: unknown }) | null;
+    if (!res.ok || !json?.route) {
+      const error = typeof json?.error === "string" ? json.error : `Squid route failed (${res.status})`;
+      throw new Error(error);
+    }
+    return json;
+  }, 3, 1000);
+}
+
+/** Poll the Squid status endpoint until success/error. */
+export async function pollSquidStatus(txHash: string, opts: { onTick?: (s: string) => void; timeoutMs?: number } = {}): Promise<string> {
+  const deadline = Date.now() + (opts.timeoutMs ?? 10 * 60_000);
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(
+        `https://api.squidrouter.com/v2/status?transactionId=${txHash}`,
+        { headers: { "x-integrator-id": SQUID_INTEGRATOR_ID } },
+      );
+      const json = await res.json() as { squidTransactionStatus?: string; status?: string; error?: { message?: string } };
+      const status = (json.squidTransactionStatus ?? json.status ?? "ongoing").toLowerCase();
+      opts.onTick?.(status);
+      if (status === "success") return "success";
+      if (status === "partial_success" || status === "needs_gas" || status === "not_found") {
+        // transient — keep polling
+      } else if (status === "error" || status === "failed") {
+        throw new Error(json.error?.message ?? "Squid reported failure");
+      }
+    } catch (e) {
+      // network blip — keep polling
+      // eslint-disable-next-line no-console
+      console.warn("squid status poll error", e);
+    }
+    await new Promise(r => setTimeout(r, 8000));
   }
-  return json;
+  throw new Error("Bridge timed out after 10 minutes");
 }
 
 function getBrowserProvider(): BrowserProvider {
@@ -70,12 +148,13 @@ export async function quoteDeposit(amountCusdHuman: string): Promise<BridgeQuote
   const provider = getBrowserProvider();
   const signer = await provider.getSigner();
   const fromAddress = await signer.getAddress();
-
+  const net = Math.max(0, parseFloat(amountCusdHuman) - DEPOSIT_FEE_USD).toString();
+  if (parseFloat(net) <= 0) throw new Error(`Amount must exceed $${DEPOSIT_FEE_USD} fee.`);
   const { route } = await getSquidRoute({
     fromAddress,
     fromChain: CELO_CHAIN_ID,
     fromToken: CUSD_CELO,
-    fromAmount: parseUnits(amountCusdHuman, 18).toString(),
+    fromAmount: parseUnits(net, 18).toString(),
     toChain: ARBITRUM_CHAIN_ID,
     toToken: USDC_ARB,
     toAddress: fromAddress,
@@ -91,15 +170,58 @@ export async function quoteDeposit(amountCusdHuman: string): Promise<BridgeQuote
 }
 
 /**
- * Bridge cUSD on Celo -> USDC on Arbitrum into the user's own wallet.
- * Approves cUSD spend if needed, then submits the Squid swap tx.
- * Returns the source-chain tx hash (trackable on Axelarscan).
+ * Full deposit pipeline:
+ *   1. Collect $0.05 fee in cUSD → CELO_FEE_TREASURY
+ *   2. Bridge net amount Celo cUSD → Arbitrum USDC to user's own wallet via Squid
+ *   3. Persist state for status polling / recovery
  */
-export async function bridgeDeposit(amountCusdHuman: string): Promise<string> {
+export async function bridgeDeposit(
+  amountCusdHuman: string,
+  opts: { onStatus?: (rec: DepositRecord) => void } = {},
+): Promise<DepositRecord> {
+  assertCeloFeeTreasury();
   const provider = getBrowserProvider();
   const signer = await provider.getSigner();
   const fromAddress = await signer.getAddress();
-  const fromAmount = parseUnits(amountCusdHuman, 18).toString();
+
+  const gross = parseFloat(amountCusdHuman);
+  const net = +(gross - DEPOSIT_FEE_USD).toFixed(6);
+  if (!(net > 0)) throw new Error(`Deposit must exceed $${DEPOSIT_FEE_USD} fee.`);
+
+  const id = crypto.randomUUID();
+  const rec: DepositRecord = {
+    id, wallet: fromAddress,
+    amountCusd: amountCusdHuman,
+    feeCusd: DEPOSIT_FEE_USD.toFixed(2),
+    netCusd: net.toString(),
+    status: "INITIATED",
+    createdAt: Date.now(), updatedAt: Date.now(),
+  };
+  upsert(rec); logEvent({ flow: "deposit", step: "initiated", status: "info", id });
+  opts.onStatus?.(rec);
+
+  // 1. Fee transfer
+  try {
+    const erc20Abi = [
+      "function transfer(address to, uint256 amount) external returns (bool)",
+      "function allowance(address owner, address spender) external view returns (uint256)",
+      "function approve(address spender, uint256 amount) external returns (bool)",
+    ];
+    const cusd = new Contract(CUSD_CELO, erc20Abi, signer);
+    const feeTx = await cusd.transfer(CELO_FEE_TREASURY, parseUnits(DEPOSIT_FEE_USD.toString(), 18));
+    await feeTx.wait();
+    rec.feeTxHash = feeTx.hash; rec.status = "FEE_PAID"; upsert(rec);
+    logEvent({ flow: "deposit", step: "fee_paid", status: "ok", id, txHash: feeTx.hash });
+    opts.onStatus?.(rec);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "Fee transfer failed";
+    rec.status = "FAILED"; rec.error = msg; upsert(rec);
+    logEvent({ flow: "deposit", step: "fee_paid", status: "error", id, error: msg });
+    opts.onStatus?.(rec);
+    throw e;
+  }
+
+  const fromAmount = parseUnits(net.toString(), 18).toString();
 
   const { route } = await getSquidRoute({
     fromAddress,
@@ -116,24 +238,53 @@ export async function bridgeDeposit(amountCusdHuman: string): Promise<string> {
   }
   const target = route.transactionRequest.target;
 
-  // Approve Squid router to pull cUSD (max approval — saves gas on subsequent deposits)
-  const erc20Abi = [
+  // 2. Approve Squid router to pull cUSD (max approval — saves gas on subsequent deposits)
+  const erc20ApproveAbi = [
     "function allowance(address owner, address spender) external view returns (uint256)",
     "function approve(address spender, uint256 amount) external returns (bool)",
   ];
-  const cusd = new Contract(CUSD_CELO, erc20Abi, signer);
-  const allowance: bigint = await cusd.allowance(fromAddress, target);
+  const cusdA = new Contract(CUSD_CELO, erc20ApproveAbi, signer);
+  const allowance: bigint = await cusdA.allowance(fromAddress, target);
   if (allowance < BigInt(fromAmount)) {
-    const tx = await cusd.approve(target, MaxUint256);
+    const tx = await cusdA.approve(target, MaxUint256);
     await tx.wait();
   }
 
-  const tx = await signer.sendTransaction({
-    to: target,
-    data: route.transactionRequest.data,
-    value: route.transactionRequest.value ?? "0",
-    chainId: Number(CELO_CHAIN_ID),
-  });
-  await tx.wait();
-  return tx.hash;
+  try {
+    const tx = await signer.sendTransaction({
+      to: target,
+      data: route.transactionRequest.data,
+      value: route.transactionRequest.value ?? "0",
+      chainId: Number(CELO_CHAIN_ID),
+    });
+    await tx.wait();
+    rec.bridgeTxHash = tx.hash; rec.status = "BRIDGING"; upsert(rec);
+    logEvent({ flow: "deposit", step: "bridging", status: "info", id, txHash: tx.hash });
+    opts.onStatus?.(rec);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "Bridge tx failed";
+    rec.status = "FAILED"; rec.error = msg; upsert(rec);
+    logEvent({ flow: "deposit", step: "bridging", status: "error", id, error: msg });
+    opts.onStatus?.(rec);
+    throw e;
+  }
+
+  // 3. Async poll status (do not block UI)
+  void (async () => {
+    try {
+      await pollSquidStatus(rec.bridgeTxHash!, {
+        onTick: (s) => { rec.squidStatus = s; upsert(rec); opts.onStatus?.(rec); },
+      });
+      rec.status = "COMPLETED"; upsert(rec);
+      logEvent({ flow: "deposit", step: "completed", status: "ok", id, txHash: rec.bridgeTxHash });
+      opts.onStatus?.(rec);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Bridge polling failed";
+      rec.status = "FAILED"; rec.error = msg; upsert(rec);
+      logEvent({ flow: "deposit", step: "completed", status: "error", id, error: msg });
+      opts.onStatus?.(rec);
+    }
+  })();
+
+  return rec;
 }
