@@ -11,6 +11,7 @@ import { logEvent } from "./logger";
 
 export const GMX_CHAIN_ID = 42161;
 const ORACLE_URL = "https://arbitrum-api.gmxinfra.io";
+const SUBSQUID_URL = "https://gmx.squids.live/gmx-synthetics-arbitrum:prod/api/graphql";
 
 /** Read-only SDK (no wallet). Safe for SSR-less browser reads. */
 export function getReadSdk(account?: string): GmxSdk {
@@ -18,6 +19,7 @@ export function getReadSdk(account?: string): GmxSdk {
     chainId: GMX_CHAIN_ID,
     rpcUrl: ARBITRUM_RPCS[0]!,
     oracleUrl: ORACLE_URL,
+    subsquidUrl: SUBSQUID_URL,
     account: (account as `0x${string}` | undefined),
   });
 }
