@@ -13,7 +13,16 @@ import {
   quoteDeposit,
   SQUID_INTEGRATOR_ID,
   type BridgeQuote,
+  type DepositRecord,
 } from "@/lib/squidBridge";
+import {
+  bridgeWithdraw,
+  quoteWithdraw,
+  getArbUsdcBalance,
+  type WithdrawRecord,
+  type WithdrawQuote,
+} from "@/lib/withdrawBridge";
+import { DEPOSIT_FEE_USD, WITHDRAW_FEE_USD, CELO_FEE_TREASURY, ARB_FEE_TREASURY } from "@/lib/fees";
 
 interface Session { wallet: string; username: string; }
 
@@ -40,72 +49,86 @@ function WalletTab({ session }: { session: Session }) {
   const [busy, setBusy] = useState(false);
   const [vaultBal, setVaultBal] = useState("0");
   const [walletBal, setWalletBal] = useState("0");
+  const [arbUsdcBal, setArbUsdcBal] = useState("0");
   const [lastTx, setLastTx] = useState<string | null>(null);
   const [quote, setQuote] = useState<BridgeQuote | null>(null);
+  const [wQuote, setWQuote] = useState<WithdrawQuote | null>(null);
   const [quoting, setQuoting] = useState(false);
+  const [activeDeposit, setActiveDeposit] = useState<DepositRecord | null>(null);
+  const [activeWithdraw, setActiveWithdraw] = useState<WithdrawRecord | null>(null);
 
   const refresh = useCallback(async () => {
-    const [v, w] = await Promise.allSettled([
+    const [v, w, a] = await Promise.allSettled([
       getVaultBalance(session.wallet),
       getWalletCusdBalance(session.wallet),
+      getArbUsdcBalance(session.wallet),
     ]);
     if (v.status === "fulfilled") setVaultBal(v.value);
     if (w.status === "fulfilled") setWalletBal(w.value);
+    if (a.status === "fulfilled") setArbUsdcBal(a.value);
   }, [session.wallet]);
 
   useEffect(() => { refresh(); }, [refresh]);
 
-  const max = mode === "deposit" ? walletBal : vaultBal;
+  const max = mode === "deposit" ? walletBal : arbUsdcBal;
   const num = parseFloat(amount || "0");
   const valid = num > 0 && num <= parseFloat(max || "0");
 
-  // Debounced Squid quote on deposit amount changes
+  // Debounced Squid quote
   useEffect(() => {
-    if (mode !== "deposit" || !valid || !SQUID_INTEGRATOR_ID) {
-      setQuote(null);
+    if (!valid || !SQUID_INTEGRATOR_ID) {
+      setQuote(null); setWQuote(null);
       return;
     }
     setQuoting(true);
     const t = setTimeout(async () => {
       try {
-        const q = await quoteDeposit(amount);
-        setQuote(q);
+        if (mode === "deposit") {
+          const q = await quoteDeposit(amount); setQuote(q); setWQuote(null);
+        } else {
+          const q = await quoteWithdraw(amount, session.wallet); setWQuote(q); setQuote(null);
+        }
       } catch {
-        setQuote(null);
+        setQuote(null); setWQuote(null);
       } finally {
         setQuoting(false);
       }
     }, 500);
     return () => clearTimeout(t);
-  }, [amount, mode, valid]);
+  }, [amount, mode, valid, session.wallet]);
 
   const submit = async () => {
     if (!valid) return;
-    if (mode === "deposit" && !SQUID_INTEGRATOR_ID) {
+    if (!SQUID_INTEGRATOR_ID) {
       toast.error("Bridge not configured. Set VITE_SQUID_INTEGRATOR_ID.");
       return;
     }
-    if (mode === "withdraw" && !FLASH_VAULT_ADDRESS) {
-      toast.error("Withdrawals require the treasury server (coming soon).");
+    if (mode === "deposit" && !CELO_FEE_TREASURY) {
+      toast.error("Deposit fee treasury not set. Configure VITE_CELO_FEE_TREASURY.");
+      return;
+    }
+    if (mode === "withdraw" && !ARB_FEE_TREASURY) {
+      toast.error("Withdraw fee treasury not set. Configure VITE_ARB_FEE_TREASURY.");
       return;
     }
     setBusy(true);
     setLastTx(null);
     try {
       toast.loading(
-        mode === "deposit" ? "Bridging cUSD → Arbitrum USDC…" : "Withdrawing cUSD…",
+        mode === "deposit" ? "Bridging cUSD → Arbitrum USDC…" : "Bridging USDC → Celo cUSD…",
         { id: "vtx" }
       );
-      const isMax = num === parseFloat(max);
-      const hash =
-        mode === "deposit"
-          ? await bridgeDeposit(amount)
-          : await withdrawCusd(isMax ? "max" : amount);
-      setLastTx(hash);
-      toast.success(
-        mode === "deposit" ? "Bridge submitted — funds en route to Arbitrum" : "Withdrawn",
-        { id: "vtx" }
-      );
+      if (mode === "deposit") {
+        const rec = await bridgeDeposit(amount, { onStatus: setActiveDeposit });
+        setActiveDeposit(rec);
+        setLastTx(rec.bridgeTxHash ?? rec.feeTxHash ?? null);
+        toast.success("Bridge submitted — tracking status", { id: "vtx" });
+      } else {
+        const rec = await bridgeWithdraw(amount, session.wallet, { onStatus: setActiveWithdraw });
+        setActiveWithdraw(rec);
+        setLastTx(rec.bridgeTxHash ?? rec.feeTxHash ?? null);
+        toast.success("Withdraw submitted — tracking status", { id: "vtx" });
+      }
       setAmount("");
       await refresh();
     } catch (e: unknown) {
@@ -116,15 +139,18 @@ function WalletTab({ session }: { session: Session }) {
     }
   };
 
+  const feeUsd = mode === "deposit" ? DEPOSIT_FEE_USD : WITHDRAW_FEE_USD;
+  const netAmount = Math.max(0, num - feeUsd);
+
   return (
     <div className="space-y-4">
       <div className="grid grid-cols-2 gap-3">
         <div className="box-sm p-3 bg-[color:var(--yellow-accent)]">
-          <div className="text-[10px] uppercase tracking-wider mb-1">Vault Balance</div>
-          <div className="font-display text-2xl">${parseFloat(vaultBal).toFixed(2)}</div>
+          <div className="text-[10px] uppercase tracking-wider mb-1">Arbitrum USDC</div>
+          <div className="font-display text-2xl">${parseFloat(arbUsdcBal).toFixed(2)}</div>
         </div>
         <div className="box-sm p-3">
-          <div className="text-[10px] uppercase tracking-wider mb-1 text-muted-foreground">In Wallet</div>
+          <div className="text-[10px] uppercase tracking-wider mb-1 text-muted-foreground">Celo cUSD</div>
           <div className="font-display text-2xl">${parseFloat(walletBal).toFixed(2)}</div>
         </div>
       </div>
@@ -146,7 +172,7 @@ function WalletTab({ session }: { session: Session }) {
       </div>
 
       <div className="flex items-center justify-between text-xs">
-        <span className="text-muted-foreground">{mode === "deposit" ? "Wallet" : "Vault"}: {parseFloat(max).toFixed(4)} cUSD</span>
+        <span className="text-muted-foreground">Available: {parseFloat(max).toFixed(4)} {mode === "deposit" ? "cUSD" : "USDC"}</span>
         <div className="flex gap-1">
           {[0.25, 0.5, 1].map(p => (
             <button key={p} onClick={() => setAmount((parseFloat(max) * p).toString())} className="box-sm px-2 py-1 text-[10px] font-bold">
@@ -162,38 +188,78 @@ function WalletTab({ session }: { session: Session }) {
         className={`box w-full font-display text-lg py-4 flex items-center justify-center gap-2 disabled:opacity-50 ${mode === "deposit" ? "bg-[color:var(--profit)] text-white" : "bg-[color:var(--yellow-accent)]"}`}
       >
         {busy ? <Loader2 className="w-5 h-5 animate-spin" /> : mode === "deposit" ? <TrendingUp className="w-5 h-5" /> : <TrendingDown className="w-5 h-5" />}
-        {busy ? "PROCESSING…" : mode === "deposit" ? "BRIDGE TO ARBITRUM" : "WITHDRAW cUSD"}
+        {busy ? "PROCESSING…" : mode === "deposit" ? "BRIDGE TO ARBITRUM" : "WITHDRAW TO MINIPAY"}
       </button>
 
-      {mode === "deposit" && valid && (
+      {valid && (
         <div className="box-sm p-3 text-xs space-y-1">
           <div className="flex justify-between">
+            <span className="text-muted-foreground">Protocol fee</span>
+            <span className="font-mono">${feeUsd.toFixed(2)}</span>
+          </div>
+          <div className="flex justify-between">
+            <span className="text-muted-foreground">Net bridged</span>
+            <span className="font-mono">{netAmount.toFixed(4)} {mode === "deposit" ? "cUSD" : "USDC"}</span>
+          </div>
+          <div className="flex justify-between">
             <span className="text-muted-foreground">You receive</span>
-            <span className="font-mono">{quoting ? "…" : quote ? `${quote.toAmount} USDC` : "—"}</span>
+            <span className="font-mono">
+              {quoting ? "…"
+                : mode === "deposit"
+                  ? quote ? `${quote.toAmount} USDC` : "—"
+                  : wQuote ? `${wQuote.toAmount} cUSD` : "—"}
+            </span>
           </div>
           <div className="flex justify-between">
             <span className="text-muted-foreground">Min received</span>
-            <span className="font-mono">{quote ? `${quote.toAmountMin} USDC` : "—"}</span>
+            <span className="font-mono">
+              {mode === "deposit"
+                ? quote ? `${quote.toAmountMin} USDC` : "—"
+                : wQuote ? `${wQuote.toAmountMin} cUSD` : "—"}
+            </span>
           </div>
           <div className="flex justify-between">
             <span className="text-muted-foreground">ETA</span>
-            <span className="font-mono">{quote ? `~${Math.max(1, Math.round(quote.estimatedRouteDuration / 60))} min` : "—"}</span>
+            <span className="font-mono">
+              {(() => {
+                const d = mode === "deposit" ? quote?.estimatedRouteDuration : wQuote?.estimatedRouteDuration;
+                return d ? `~${Math.max(1, Math.round(d / 60))} min` : "—";
+              })()}
+            </span>
           </div>
           <div className="flex justify-between">
             <span className="text-muted-foreground">Route</span>
-            <span>Celo cUSD → Arbitrum USDC</span>
+            <span>{mode === "deposit" ? "Celo cUSD → Arbitrum USDC" : "Arbitrum USDC → Celo cUSD"}</span>
           </div>
+        </div>
+      )}
+
+      {(activeDeposit || activeWithdraw) && (
+        <div className="box-sm p-3 text-xs space-y-1 bg-[color:var(--cyan-accent)]/10">
+          <div className="flex justify-between font-bold">
+            <span>Status</span>
+            <span>{activeDeposit?.status ?? activeWithdraw?.status}</span>
+          </div>
+          {(activeDeposit?.squidStatus ?? activeWithdraw?.squidStatus) && (
+            <div className="flex justify-between">
+              <span className="text-muted-foreground">Bridge</span>
+              <span className="font-mono">{activeDeposit?.squidStatus ?? activeWithdraw?.squidStatus}</span>
+            </div>
+          )}
+          {(activeDeposit?.error ?? activeWithdraw?.error) && (
+            <div className="text-[color:var(--loss)]">{activeDeposit?.error ?? activeWithdraw?.error}</div>
+          )}
         </div>
       )}
 
       {lastTx && (
         <a
-          href={mode === "deposit" ? `https://axelarscan.io/gmp/${lastTx}` : `https://celoscan.io/tx/${lastTx}`}
+          href={`https://axelarscan.io/gmp/${lastTx}`}
           target="_blank"
           rel="noreferrer"
           className="flex items-center justify-center gap-1 text-xs text-[color:var(--cyan-accent)] font-bold"
         >
-          {mode === "deposit" ? "Track on Axelarscan" : "View transaction"} <ExternalLink className="w-3 h-3" />
+          Track on Axelarscan <ExternalLink className="w-3 h-3" />
         </a>
       )}
 
@@ -204,7 +270,7 @@ function WalletTab({ session }: { session: Session }) {
       )}
 
       <div className="border-t border-dashed pt-3 text-xs text-muted-foreground leading-relaxed">
-        Powered by Squid Router. Deposits bridge cUSD on Celo → USDC on Arbitrum into your own wallet — used as collateral for GMX v2 perps. Non-custodial, one signature, ~1–3 min settlement.
+        Powered by Squid Router. Non-custodial: USDC sits in your own Arbitrum wallet — used as collateral for GMX v2 perps. Withdrawals bridge USDC back to cUSD into MiniPay. Protocol fees: $0.05 deposit, $0.10 withdrawal.
       </div>
     </div>
   );
