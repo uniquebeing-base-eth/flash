@@ -13,6 +13,31 @@ const TF_MAP: Record<string, { interval: string; range: string }> = {
   "1d": { interval: "1d", range: "1y" },
 };
 
+const BINANCE_TF: Record<string, string> = {
+  "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
+  "1h": "1h", "4h": "4h", "1d": "1d",
+};
+
+// Binance has multiple data hosts; some are geo-restricted. Try in order.
+const BINANCE_HOSTS = [
+  "https://data-api.binance.vision",
+  "https://api.binance.com",
+  "https://api1.binance.com",
+  "https://api2.binance.com",
+];
+
+async function binanceFetch(path: string): Promise<unknown> {
+  let lastErr: unknown;
+  for (const host of BINANCE_HOSTS) {
+    try {
+      const res = await fetch(`${host}${path}`);
+      if (!res.ok) { lastErr = new Error(`Binance ${res.status}`); continue; }
+      return await res.json();
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr ?? new Error("Binance unreachable");
+}
+
 async function loadYahooChart(symbol: string, interval: string, range: string) {
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${interval}&range=${range}`;
   const res = await fetch(url, { headers: YAHOO_HEADERS });
@@ -85,4 +110,55 @@ export const fetchYahooSnapshots = createServerFn({ method: "GET" })
       return [symbol, { price, change24h }] as const;
     }));
     return { snapshots: Object.fromEntries(entries) as Record<string, { price: number; change24h: number }> };
+  });
+
+/**
+ * Server-side Binance proxy. Binance API is often geo-blocked from end-user
+ * browsers (HTTP 451), but reachable from our Cloudflare Worker.
+ */
+export const fetchBinanceCandles = createServerFn({ method: "GET" })
+  .inputValidator((d: { symbol: string; timeframe: string }) => d)
+  .handler(async ({ data }) => {
+    const tf = BINANCE_TF[data.timeframe] ?? "1h";
+    const rows = (await binanceFetch(`/api/v3/klines?symbol=${data.symbol}&interval=${tf}&limit=60`)) as unknown[][];
+    const candles: CandleDto[] = rows.map((r) => ({
+      t: Number(r[0]),
+      o: parseFloat(String(r[1])),
+      h: parseFloat(String(r[2])),
+      l: parseFloat(String(r[3])),
+      c: parseFloat(String(r[4])),
+      v: parseFloat(String(r[5])),
+    }));
+    const ticker = (await binanceFetch(`/api/v3/ticker/24hr?symbol=${data.symbol}`)) as { lastPrice: string; priceChangePercent: string };
+    return {
+      candles,
+      price: Number(ticker.lastPrice) || candles.at(-1)?.c || 0,
+      change24h: Number(ticker.priceChangePercent) || 0,
+    };
+  });
+
+export const fetchBinanceSnapshots = createServerFn({ method: "GET" })
+  .inputValidator((d: { symbols: string[] }) => ({ symbols: d.symbols.slice(0, 24) }))
+  .handler(async ({ data }) => {
+    if (!data.symbols.length) return { snapshots: {} as Record<string, { price: number; change24h: number }> };
+    const qs = encodeURIComponent(JSON.stringify(data.symbols));
+    try {
+      const rows = (await binanceFetch(`/api/v3/ticker/24hr?symbols=${qs}`)) as Array<{ symbol: string; lastPrice: string; priceChangePercent: string }>;
+      const snapshots: Record<string, { price: number; change24h: number }> = {};
+      for (const row of rows) {
+        snapshots[row.symbol] = { price: Number(row.lastPrice) || 0, change24h: Number(row.priceChangePercent) || 0 };
+      }
+      return { snapshots };
+    } catch {
+      // Fallback: fetch one by one
+      const entries = await Promise.all(data.symbols.map(async (symbol) => {
+        try {
+          const row = (await binanceFetch(`/api/v3/ticker/24hr?symbol=${symbol}`)) as { lastPrice: string; priceChangePercent: string };
+          return [symbol, { price: Number(row.lastPrice) || 0, change24h: Number(row.priceChangePercent) || 0 }] as const;
+        } catch {
+          return [symbol, { price: 0, change24h: 0 }] as const;
+        }
+      }));
+      return { snapshots: Object.fromEntries(entries) };
+    }
   });
