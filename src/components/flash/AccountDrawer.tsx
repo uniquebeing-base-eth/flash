@@ -45,14 +45,12 @@ function WalletTab({ session }: { session: Session }) {
   const [quoting, setQuoting] = useState(false);
 
   const refresh = useCallback(async () => {
-    try {
-      const [v, w] = await Promise.all([
-        getVaultBalance(session.wallet),
-        getWalletCusdBalance(session.wallet),
-      ]);
-      setVaultBal(v);
-      setWalletBal(w);
-    } catch { /* wallet may not be ready */ }
+    const [v, w] = await Promise.allSettled([
+      getVaultBalance(session.wallet),
+      getWalletCusdBalance(session.wallet),
+    ]);
+    if (v.status === "fulfilled") setVaultBal(v.value);
+    if (w.status === "fulfilled") setWalletBal(w.value);
   }, [session.wallet]);
 
   useEffect(() => { refresh(); }, [refresh]);
