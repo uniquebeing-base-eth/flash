@@ -31,11 +31,12 @@ interface LiveMarketArgs {
 
 export function useLiveMarketV2({ binance: binanceSymbol, yahoo: yahooSymbol, fallbackSeed, basePrice, timeframe }: LiveMarketArgs) {
   const [candles, setCandles] = useState<Candle[]>([]);
-  const [price, setPrice] = useState<number>(basePrice);
+  const [price, setPrice] = useState<number>(0);
   const [change24h, setChange24h] = useState<number | undefined>(undefined);
   const _tfMs = TF_TO_MS[timeframe] ?? 60_000;
   void _tfMs;
   void fallbackSeed;
+  void basePrice;
 
   useEffect(() => {
     let cancelled = false;
