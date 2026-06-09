@@ -108,7 +108,7 @@ export async function pollSquidStatus(txHash: string, opts: { onTick?: (s: strin
   while (Date.now() < deadline) {
     try {
       const res = await fetch(
-        `https://api.squidrouter.com/v2/status?transactionId=${txHash}`,
+        `https://apiplus.squidrouter.com/v2/status?transactionId=${txHash}&fromChainId=${CELO_CHAIN_ID}&toChainId=${ARBITRUM_CHAIN_ID}`,
         { headers: { "x-integrator-id": SQUID_INTEGRATOR_ID } },
       );
       const json = await res.json() as { squidTransactionStatus?: string; status?: string; error?: { message?: string } };
@@ -183,6 +183,19 @@ export async function bridgeDeposit(
   const provider = getBrowserProvider();
   const signer = await provider.getSigner();
   const fromAddress = await signer.getAddress();
+
+  // Ensure wallet is on Celo before any signing
+  const network = await provider.getNetwork();
+  if (Number(network.chainId) !== Number(CELO_CHAIN_ID)) {
+    try {
+      await window.ethereum!.request({
+        method: "wallet_switchEthereumChain",
+        params: [{ chainId: "0xa4ec" }],
+      });
+    } catch {
+      throw new Error("Switch wallet to Celo to deposit.");
+    }
+  }
 
   const gross = parseFloat(amountCusdHuman);
   const net = +(gross - DEPOSIT_FEE_USD).toFixed(6);
