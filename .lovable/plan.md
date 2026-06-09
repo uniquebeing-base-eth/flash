@@ -1,101 +1,97 @@
 
-# GMX + Squid Integration
+# Make Flash Trading Real
 
-Wires the three-leg flow (deposit → trade → withdraw) on top of the existing UI. No redesign. Squid for bridging, GMX SDK v2 for read/write, our app only routes funds and deducts fixed fees.
+Wire live GMX v2 reads, real order execution (market + TP/SL), all GMX markets, and verify the Squid bridge end-to-end. Strip all demo/mock data.
 
-## 1. Config & secrets
+## 1. GMX market discovery (all tradable markets)
 
-Add to `.env`:
-- `VITE_CELO_FEE_TREASURY` — receives $0.05 deposit fee (cUSD on Celo)
-- `VITE_ARB_FEE_TREASURY` — receives $0.10 withdrawal fee (USDC on Arbitrum)
-- `VITE_ARBITRUM_RPC_URL` — primary Arbitrum RPC (with one fallback hardcoded)
+`src/lib/gmx.ts` — fetch the full market list from GMX subsquid + tickers and expose to UI.
 
-Hardcoded constants in `src/lib/fees.ts`:
-- `DEPOSIT_FEE_USD = 0.05`
-- `WITHDRAW_FEE_USD = 0.10`
+- `fetchGmxMarkets()` → calls `https://arbitrum-api.gmxinfra.io/markets` + `/tokens` + `/prices/tickers` (public, edge-safe HTTP).
+- Returns: `{ marketAddress, indexToken, longToken, shortToken, symbol, name, maxLeverage, indexPrice, change24h }`.
+- Cached 30s in module memory.
+- Surface synthetic markets too (forex/commodities perps on GMX where available).
 
-Both fees displayed in UI before any signature.
+`src/components/flash/markets.ts` — rebuild `MARKETS` dynamically from GMX response (replace hard-coded list). Chart symbol mapping: GMX `indexToken.symbol` → Binance `<SYM>USDT` when crypto, else use GMX oracle price feed directly via `/prices/tickers` polled every 3s. **Removes the hard-coded MARKETS demo prices.**
 
-## 2. Deposit (Celo → Arbitrum USDC)
+## 2. Live position sync via subsquid + polling
 
-File: `src/lib/squidBridge.ts` (extend existing).
+`src/lib/gmxPositions.ts` (new):
 
-State machine persisted in `localStorage` keyed by `depositId` (uuid):
-`INITIATED → FEE_PAID → BRIDGING → COMPLETED | FAILED`
+- `fetchPositions(account)` — queries the GMX subsquid GraphQL endpoint:
+  ```
+  query { positions(where: { account: $a, sizeInUsd_gt: 0 }) {
+    id key market isLong sizeInUsd collateralAmount entryPrice
+  } }
+  ```
+- Joins with live tickers to compute markPrice → pnl, pnl%, liquidation price using GMX's formula:
+  `liq = entryPrice ± entryPrice * (collateralUsd - maintenanceMargin) / sizeInUsd`.
+- `useLivePositions(account)` React hook — polls every 4s via `setInterval`, merges with order events from subsquid (`orders` table filtered by `account` + `status`).
+- Exports `OpenPosition` with `markPrice`, `pnl`, `pnlPercentage`, `liquidationPrice`, `triggerOrders[]` (TP/SL).
 
-Flow in `bridgeDeposit(amountCusdHuman)`:
-1. Compute `feeCusd` = $0.05 worth of cUSD (1:1 assumption, cUSD is USD-pegged).
-2. `netAmount = amount - feeCusd`. Reject if `netAmount <= 0`.
-3. Send `feeCusd` cUSD transfer → `VITE_CELO_FEE_TREASURY`. Mark `FEE_PAID`.
-4. Call Squid `v2/route` with `netAmount`, `toAddress = user's Arbitrum address` (same wallet).
-5. Approve cUSD to Squid target if needed, submit tx. Mark `BRIDGING`, store `srcTxHash`.
-6. Poll `https://api.squidrouter.com/v2/status?transactionId=<hash>` every 8s up to ~10 min. On `success` → `COMPLETED`. On error → retry up to 3x then `FAILED`.
+This becomes the **source of truth** — `src/routes/index.tsx` no longer keeps `position` in `useState`; it reads from the hook.
 
-Recovery: expose `retryDeposit(depositId)` that resumes from last persisted step.
+## 3. Order execution: market + TP/SL
 
-UI: `AccountDrawer` shows live status badge + fee line ("Network fee: $0.05") before signing.
+`src/lib/gmxOrders.ts` (new) — direct ExchangeRouter calls (skips the SDK's heavier wallet client requirement; viem-free path).
 
-## 3. Trading (GMX v2)
+Approach: GMX v2 routes all orders through `ExchangeRouter.multicall([...])`. We build calldata directly:
 
-Install `@gmx-io/sdk` and use `GmxApiSdk` (HTTP-backed, Worker-safe — no native deps).
+- `createIncreaseOrder({ marketAddress, collateralToken, isLong, sizeDeltaUsd, collateralAmount, acceptablePrice, slippageBps, executionFee, triggerPrice?, orderType })`
+- For market order: `orderType = MarketIncrease (2)`.
+- For TP: `orderType = LimitDecrease (4)` with `triggerPrice` above entry (long) / below entry (short).
+- For SL: `orderType = StopLossDecrease (6)`.
 
-File: `src/lib/gmx.ts`:
-- `getMarkets()` → `apiSdk.fetchMarkets()` cached 60s
-- `getPositions(address)` → `apiSdk.fetchPositionsInfo({ address, includeRelatedOrders: true })` cached 5s
-- `openMarketOrder({ marketSymbol, isLong, sizeUsd, leverage, collateralUsdc })` → prepare via SDK, sign with browser wallet on Arbitrum, submit.
-- `closePosition(positionKey)` → same pattern.
+Submission flow per trade:
+1. Approve USDC → `OrderVault` (max once).
+2. `sendWnt(executionFee)` — wraps ETH for keeper.
+3. `sendTokens(USDC, OrderVault, collateral)`.
+4. `createOrder(params)` for the market increase.
+5. If TP/SL set: append `createOrder` calls for `LimitDecrease` + `StopLossDecrease` in the same multicall.
 
-App is **router only**: no fee injection, no PnL override. PnL/liq prices come from `fetchPositionsInfo`.
+ABI + addresses pulled from `https://arbitrum-api.gmxinfra.io/markets` config. We hardcode the ExchangeRouter address (`0x900173A66dbD345006C51fA35fA3aB760FcD843b`) and OrderVault (`0x31eF83a530Fde1B38EE9A18093A333D8Bbbc40D5`).
 
-Local mirror in `localStorage` for UX continuity:
-`{ user, positionKey, marketSymbol, sizeUsd, collateralUsd, entryPrice, status: OPEN|CLOSED }`.
-Reconciled on every poll from GMX as source of truth.
+`closePosition({ positionKey, sizeDeltaUsd, isLong })` — same pattern with `MarketDecrease (4)`.
 
 UI wiring in `src/routes/index.tsx`:
-- Replace the current mock `setPosition` with `openMarketOrder` call.
-- Show pending state during keeper execution (~10-30s).
-- Poll positions every 5s while a position is open; update entry/PnL/liq from GMX response.
+- LONG/SHORT buttons → `createIncreaseOrder(...)` with current size/leverage + optional TP/SL inputs.
+- Add TP/SL number inputs in the trade panel (replacing the current dead toggle).
+- "CLOSE POSITION" → `closePosition` with full size.
+- Pending state during keeper execution (10–30s); position hook reconciles.
 
-Chain switch: if `wallet.chainId !== 42161`, prompt `wallet_switchEthereumChain` before order.
+## 4. Verify Squid bridging
 
-## 4. Withdrawal (Arbitrum → Celo cUSD)
+- Fix `pollSquidStatus` endpoint: the v2 path is `https://apiplus.squidrouter.com/v2/status?transactionId=<hash>&fromChainId=...&toChainId=...`. Update both deposit + withdraw.
+- Add `requestId` capture from route response (Squid uses `requestId` not `transactionId` for new flows).
+- Replace Axelarscan link with Squid's tracker: `https://axelarscan.io/gmp/<txHash>` only if Axelar route; otherwise `https://app.squidrouter.com/transaction/<hash>`.
+- Test path: quoteDeposit → see fee + ETA → submit → status badge transitions FEE_PAID → BRIDGING → COMPLETED.
+- Add chain switch before deposit signing (wallet must be on Celo 42220).
 
-File: `src/lib/withdraw.ts`.
+## 5. Remove all demo data
 
-State machine:
-`INITIATED → POSITION_CLOSING → BRIDGING_BACK → COMPLETED | FAILED`
+- `src/components/flash/markets.ts`: delete hard-coded list (dynamic from GMX).
+- `src/routes/index.tsx`: remove `basePrice` fallback, "I'M FEELING LUCKY" random button.
+- `AccountDrawer` ProfileTab: replace hardcoded stats (23 trades, 61%, $124.22…) with reads from `localStorage`-stored real trade history + `Streak` random data → empty state until real trades exist.
+- `HistoryDrawer`, `LeaderboardDrawer`: read from real sources (GMX subsquid `trades` for history; leaderboard becomes "Coming soon" until we have a backend).
+- `src/lib/marketData.ts`: drop `basePrice` arg, remove all `fallbackSeed` paths; if GMX/Binance fail, show "—" not synthetic numbers.
 
-Flow:
-1. Check `getPositions(user)`. If any `OPEN` → block with "Close all positions first".
-2. Send $0.10 USDC → `VITE_ARB_FEE_TREASURY`.
-3. `netAmount = usdcBalance - 0.10`. Show bridge cost estimate from Squid quote.
-4. Squid `v2/route` Arbitrum USDC → Celo cUSD, `toAddress = MiniPay address`.
-5. Approve + submit, poll status same as deposit.
-6. On `success` → `COMPLETED`.
+## 6. Files
 
-UI: new Withdraw section in `AccountDrawer` with amount input, fee breakdown, status.
+**New:** `src/lib/gmxOrders.ts`, `src/lib/gmxPositions.ts`, `src/lib/gmxMarkets.ts`, `src/hooks/useLivePositions.ts`.
 
-## 5. Error handling
+**Edited:** `src/lib/gmx.ts`, `src/lib/squidBridge.ts`, `src/lib/withdrawBridge.ts`, `src/lib/marketData.ts`, `src/components/flash/markets.ts`, `src/components/flash/AccountDrawer.tsx`, `src/components/flash/HistoryDrawer.tsx`, `src/components/flash/LeaderboardDrawer.tsx`, `src/routes/index.tsx`.
 
-- Squid: 3 retries with exponential backoff (1s, 3s, 8s). On final failure, store `FAILED` with last error and surface "Retry" button calling `retryDeposit` / `retryWithdraw`.
-- GMX: if order submission reverts, do not bridge anything; show toast with revert reason.
-- RPC: wrap Arbitrum reads in `withRpcFallback([primary, 'https://arb1.arbitrum.io/rpc'])`.
+**Deps:** keep `@gmx-io/sdk` (for read fallbacks only); add no new runtime deps. All order calldata built with `ethers.Interface`.
 
-## 6. Logging
+## 7. Out of scope this pass
 
-`src/lib/logger.ts` — single `logEvent({ flow, step, status, txHash, error })` that writes to `console.info` and a capped (200-entry) ring buffer in `localStorage` viewable via a hidden debug panel.
+- Gasless/relayed orders (Gelato) — user pays ARB gas, signs each tx in MiniPay.
+- On-chain trade history archive in our DB — we read from GMX subsquid directly.
+- Cross-margin / portfolio mode — isolated only.
 
-Logged events: `deposit.initiated`, `deposit.fee_paid`, `deposit.bridging`, `deposit.completed/failed`, `trade.submitted`, `trade.opened/closed/failed`, `withdraw.*`.
+## Risks / unknowns
 
-## Technical details
+- **GMX ExchangeRouter ABI**: I'll inline only the methods we call (`multicall`, `sendWnt`, `sendTokens`, `createOrder`). If oracle params (acceptablePrice resolution from tickers) drift, the order may revert with `OrderPriceMismatch`; we surface the revert reason and bump slippage to 0.5% default.
+- **Position liq price** is approximate without GMX's funding fee state. We label it "Est. Liq." in the UI to be honest.
+- **MiniPay multi-sig**: each step = a separate signature prompt. We batch approve+order via multicall where possible.
 
-- Files touched: `.env`, `src/lib/squidBridge.ts`, `src/lib/fees.ts` (new), `src/lib/gmx.ts` (new), `src/lib/withdraw.ts` (new), `src/lib/logger.ts` (new), `src/lib/rpc.ts` (new), `src/components/flash/AccountDrawer.tsx`, `src/routes/index.tsx`.
-- New deps: `@gmx-io/sdk` (HTTP client, edge-safe), `uuid`.
-- No backend server functions needed — all signing is wallet-side, all reads are public HTTP. Keeps the Cloudflare bundle clean.
-- MiniPay constraint: single-signature flows. Each step (fee transfer, approval, bridge tx) is a separate signature; we batch where possible (max approval once).
-
-## Out of scope (confirm)
-
-- No custodial vault; user's own Arbitrum address holds USDC and GMX position.
-- No GraphQL history view yet (can add later as a `History` tab).
-- Delegated/gasless trading via Gelato relay — not in this pass.
