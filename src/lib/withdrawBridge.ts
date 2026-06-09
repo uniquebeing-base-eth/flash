@@ -3,7 +3,7 @@ import { ARB_FEE_TREASURY, WITHDRAW_FEE_USD, assertArbFeeTreasury } from "./fees
 import { logEvent } from "./logger";
 import { withRetry, arbitrumReadProvider } from "./rpc";
 import { pollSquidStatus, SQUID_INTEGRATOR_ID, USDC_ARB, CUSD_CELO, ARBITRUM_CHAIN_ID, CELO_CHAIN_ID } from "./squidBridge";
-import { getOpenPositions } from "./gmx";
+import { fetchGmxPositions } from "./gmxPositions.functions";
 
 export type WithdrawStatus =
   | "INITIATED"
@@ -124,8 +124,8 @@ export async function bridgeWithdraw(
   const from = await signer.getAddress();
 
   // Block if open GMX positions
-  const openPositions = await getOpenPositions(from).catch(() => []);
-  if (openPositions.length > 0) {
+  const posResp = await fetchGmxPositions({ data: { account: from } }).catch(() => ({ positions: [] as unknown[] }));
+  if ((posResp.positions?.length ?? 0) > 0) {
     throw new Error("Close all open positions before withdrawing.");
   }
 
