@@ -1,6 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useState, useEffect } from "react";
-import { User, History, Trophy, ChevronDown, TrendingUp, TrendingDown, Shuffle, Eye, Info, Zap } from "lucide-react";
+import { useState, useEffect, useMemo } from "react";
+import { toast } from "sonner";
+import { User, History, Trophy, ChevronDown, TrendingUp, TrendingDown, Eye, Info, Zap, Loader2 } from "lucide-react";
 import { MARKETS, type Market } from "@/components/flash/markets";
 import { Chart } from "@/components/flash/Chart";
 import { AccountDrawer } from "@/components/flash/AccountDrawer";
@@ -8,15 +9,18 @@ import { HistoryDrawer } from "@/components/flash/HistoryDrawer";
 import { LeaderboardDrawer } from "@/components/flash/LeaderboardDrawer";
 import { UsernameGate } from "@/components/flash/UsernameGate";
 import { useLiveMarketV2, useMarketSnapshots } from "@/lib/marketData";
-import { getVaultBalance, FLASH_VAULT_ADDRESS } from "@/lib/flashVault";
+import { useGmxMarkets } from "@/hooks/useGmxMarkets";
+import { useLivePositions } from "@/hooks/useLivePositions";
+import { openMarketPosition, closeMarketPosition } from "@/lib/gmxOrders";
+import { getArbUsdcBalance } from "@/lib/withdrawBridge";
 
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
       { title: "Flash — Perps Made Simple" },
-      { name: "description", content: "Trade crypto, forex & commodities perpetuals directly from MiniPay. Deposit cUSD, trade global markets, withdraw seamlessly." },
+      { name: "description", content: "Trade GMX v2 perpetuals directly from MiniPay. Deposit cUSD, trade crypto / forex / commodities, withdraw to cUSD." },
       { property: "og:title", content: "Flash — Perps Made Simple" },
-      { property: "og:description", content: "MiniPay-native perpetual trading. Crypto, forex, commodities." },
+      { property: "og:description", content: "MiniPay-native GMX v2 trading." },
     ],
   }),
   component: Page,
@@ -33,25 +37,33 @@ function Index({ session }: { session: { wallet: string; username: string } }) {
   const [leverage, setLeverage] = useState(20);
   const [sizePct, setSizePct] = useState(0);
   const [drawer, setDrawer] = useState<null | "account" | "history" | "lb">(null);
-  const [position, setPosition] = useState<null | { dir: "LONG" | "SHORT"; entry: number; size: number; lev: number; margin: number; sym: string }>(null);
+  const [tpInput, setTpInput] = useState("");
+  const [slInput, setSlInput] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [closing, setClosing] = useState(false);
   const [balance, setBalance] = useState(0);
 
-  // Poll on-chain vault balance
+  // Real Arbitrum USDC balance — used as GMX collateral
   useEffect(() => {
-    if (!FLASH_VAULT_ADDRESS) return;
     let cancelled = false;
     const load = async () => {
       try {
-        const b = await getVaultBalance(session.wallet);
+        const b = await getArbUsdcBalance(session.wallet);
         if (!cancelled) setBalance(parseFloat(b));
       } catch { /* ignore */ }
     };
     load();
     const id = setInterval(load, 15000);
     return () => { cancelled = true; clearInterval(id); };
-  }, [session.wallet, drawer]);
+  }, [session.wallet, drawer, submitting, closing]);
+
+  const gmx = useGmxMarkets();
+  const { positions, reload: reloadPositions } = useLivePositions(session.wallet, gmx.indexMetaByMarket);
 
   const market = MARKETS[marketIdx];
+  const indexSym = market.symbol.split("/")[0];
+  const gmxMarket = gmx.bySymbol[indexSym] ?? gmx.bySymbol[market.symbol];
+  const tradable = !!gmxMarket;
 
   const marketSnapshots = useMarketSnapshots(MARKETS);
   const { candles, price: livePrice, change24h: liveChange24h } = useLiveMarketV2({
@@ -63,22 +75,81 @@ function Index({ session }: { session: { wallet: string; username: string } }) {
   });
   const selectedChange24h = typeof liveChange24h === "number" && Number.isFinite(liveChange24h)
     ? liveChange24h
-    : (marketSnapshots[marketIdx]?.change24h ?? market.change24h);
+    : (marketSnapshots[marketIdx]?.change24h ?? gmxMarket?.change24h ?? 0);
+  const displayPrice = livePrice || gmxMarket?.price || 0;
 
-  const sizeUsd = +(balance * (sizePct / 100) * leverage || 1).toFixed(2);
-  const margin = +(sizeUsd / leverage).toFixed(2);
-  const liqL = +(livePrice * (1 - 0.95 / leverage)).toFixed(2);
-  const liqS = +(livePrice * (1 + 0.95 / leverage)).toFixed(2);
+  const activePosition = useMemo(
+    () => positions.find(p => gmxMarket && p.marketAddress.toLowerCase() === gmxMarket.marketToken.toLowerCase()),
+    [positions, gmxMarket],
+  );
 
-  const pnl = position ? (position.dir === "LONG" ? (livePrice - position.entry) : (position.entry - livePrice)) * (position.size / position.entry) : 0;
-  const pnlPct = position ? (pnl / position.margin) * 100 : 0;
-  const netWorth = balance + (position ? pnl : 0);
+  const collateralUsd = +(balance * (sizePct / 100) || 0).toFixed(2);
+  const sizeUsd = +(collateralUsd * leverage).toFixed(2);
+  const margin = collateralUsd;
+  const liqL = +(displayPrice * (1 - 0.95 / leverage)).toFixed(2);
+  const liqS = +(displayPrice * (1 + 0.95 / leverage)).toFixed(2);
 
-  const open = (dir: "LONG" | "SHORT") => {
-    setPosition({ dir, entry: livePrice, size: sizeUsd, lev: leverage, margin, sym: market.symbol.split("/")[0] });
+  const totalPnl = positions.reduce((s, p) => s + p.pnl, 0);
+  const totalCol = positions.reduce((s, p) => s + p.collateralUsd, 0);
+  const totalPct = totalCol > 0 ? (totalPnl / totalCol) * 100 : 0;
+  const netWorth = balance + totalPnl;
+
+  const submitOrder = async (isLong: boolean) => {
+    if (!gmxMarket) { toast.error("This market is not tradable on GMX yet."); return; }
+    if (collateralUsd <= 0) { toast.error("Set a position size first."); return; }
+    if (collateralUsd > balance) { toast.error("Insufficient USDC on Arbitrum."); return; }
+    const indexDecimals = gmx.indexMetaByMarket[gmxMarket.marketToken.toLowerCase()]?.decimals ?? 18;
+    const tp = parseFloat(tpInput) || undefined;
+    const sl = parseFloat(slInput) || undefined;
+    setSubmitting(true);
+    try {
+      toast.loading("Submitting order to GMX…", { id: "ord" });
+      await openMarketPosition({
+        marketAddress: gmxMarket.marketToken,
+        indexTokenDecimals: indexDecimals,
+        collateralAmountUsdc: collateralUsd,
+        sizeDeltaUsd: sizeUsd,
+        isLong,
+        markPrice: displayPrice,
+        takeProfitPrice: tp,
+        stopLossPrice: sl,
+      });
+      toast.success("Order submitted — keeper executing shortly", { id: "ord" });
+      setTpInput(""); setSlInput("");
+      setTimeout(() => { void reloadPositions(); }, 6000);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Order failed";
+      toast.error(msg.length > 120 ? msg.slice(0, 120) + "…" : msg, { id: "ord" });
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const closeActive = async () => {
+    if (!activePosition) return;
+    setClosing(true);
+    try {
+      toast.loading("Closing position on GMX…", { id: "cls" });
+      await closeMarketPosition({
+        marketAddress: activePosition.marketAddress,
+        indexTokenDecimals: activePosition.indexTokenDecimals,
+        sizeDeltaUsd: activePosition.sizeUsd,
+        collateralDeltaUsdc: activePosition.collateralUsd,
+        isLong: activePosition.isLong,
+        markPrice: activePosition.markPrice,
+      });
+      toast.success("Close submitted", { id: "cls" });
+      setTimeout(() => { void reloadPositions(); }, 6000);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Close failed";
+      toast.error(msg.length > 120 ? msg.slice(0, 120) + "…" : msg, { id: "cls" });
+    } finally {
+      setClosing(false);
+    }
   };
 
   const tfs = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"];
+  const fmtP = (p: number) => p ? p.toLocaleString(undefined, { maximumFractionDigits: p >= 10 ? 2 : 5 }) : "—";
 
   return (
     <div className="min-h-screen pb-16">
@@ -89,12 +160,12 @@ function Index({ session }: { session: { wallet: string; username: string } }) {
             <div className="text-[11px] uppercase tracking-wider text-muted-foreground flex items-center gap-1">
               Net Worth: <span className="font-bold text-foreground">${netWorth.toFixed(2)}</span> <Eye className="w-3 h-3" />
             </div>
-            <div className={`font-display text-5xl ${position && pnl !== 0 ? (pnl > 0 ? "text-[color:var(--profit)]" : "text-[color:var(--loss)]") : "text-muted-foreground"}`}>
-              {position ? (pnl >= 0 ? "+" : "-") : ""}${Math.abs(position ? pnl : 0).toFixed(2)}
+            <div className={`font-display text-5xl ${positions.length ? (totalPnl >= 0 ? "text-[color:var(--profit)]" : "text-[color:var(--loss)]") : "text-muted-foreground"}`}>
+              {positions.length ? (totalPnl >= 0 ? "+" : "-") : ""}${Math.abs(positions.length ? totalPnl : 0).toFixed(2)}
             </div>
-            {position && (
-              <div className={`text-sm font-bold ${pnl >= 0 ? "text-[color:var(--profit)]" : "text-[color:var(--loss)]"}`}>
-                {pnl >= 0 ? "+" : ""}{pnlPct.toFixed(2)}%
+            {positions.length > 0 && (
+              <div className={`text-sm font-bold ${totalPnl >= 0 ? "text-[color:var(--profit)]" : "text-[color:var(--loss)]"}`}>
+                {totalPnl >= 0 ? "+" : ""}{totalPct.toFixed(2)}%
               </div>
             )}
           </div>
@@ -110,14 +181,14 @@ function Index({ session }: { session: { wallet: string; username: string } }) {
           <button onClick={() => setMarketOpen(o => !o)} className="box-sm flex-1 px-3 py-3 flex items-center justify-between bg-white">
             <div className="flex items-center gap-2">
               <span className="w-6 h-6 rounded-full bg-foreground text-background grid place-items-center text-xs font-bold">{market.icon}</span>
-              <span className="font-bold text-sm">${livePrice.toLocaleString()}</span>
+              <span className="font-bold text-sm">${fmtP(displayPrice)}</span>
               <span className={`text-xs font-bold ${selectedChange24h >= 0 ? "text-[color:var(--profit)]" : "text-[color:var(--loss)]"}`}>
                 {selectedChange24h >= 0 ? "+" : ""}{selectedChange24h.toFixed(2)}%
               </span>
             </div>
             <ChevronDown className={`w-4 h-4 transition ${marketOpen ? "rotate-180" : ""}`} />
           </button>
-          <div className="text-xs text-muted-foreground">No favorites</div>
+          <div className="text-xs text-muted-foreground">{gmx.markets.length} mkts</div>
         </div>
 
         {marketOpen && (
@@ -125,19 +196,22 @@ function Index({ session }: { session: { wallet: string; username: string } }) {
             {(["Crypto", "Forex", "Commodities"] as const).map(cat => (
               <div key={cat}>
                 <div className="px-3 py-1 text-[10px] uppercase tracking-wider text-muted-foreground bg-muted border-b border-foreground">{cat}</div>
-                {MARKETS.filter(m => m.category === cat).map((m: Market, _i) => {
+                {MARKETS.filter(m => m.category === cat).map((m: Market) => {
                   const idx = MARKETS.indexOf(m);
                   const snapshot = marketSnapshots[idx];
-                  const rowPrice = snapshot?.price ?? m.price;
-                  const rowChange = snapshot?.change24h ?? m.change24h;
+                  const sym = m.symbol.split("/")[0];
+                  const gm = gmx.bySymbol[sym];
+                  const rowPrice = snapshot?.price ?? gm?.price ?? 0;
+                  const rowChange = snapshot?.change24h ?? gm?.change24h ?? 0;
                   return (
                     <button key={m.symbol} onClick={() => { setMarketIdx(idx); setMarketOpen(false); }} className={`w-full px-3 py-2 flex items-center justify-between border-b border-foreground/10 ${idx === marketIdx ? "bg-[color:var(--yellow-accent)]" : ""}`}>
                       <div className="flex items-center gap-2">
                         <span className="w-6 h-6 rounded-full bg-foreground text-background grid place-items-center text-[10px] font-bold">{m.icon}</span>
                         <span className="font-bold text-sm">{m.symbol}</span>
+                        {gm && <span className="text-[9px] px-1 bg-[color:var(--profit)] text-white font-bold">GMX</span>}
                       </div>
                       <div className="text-right">
-                        <div className="text-xs font-mono">${rowPrice.toLocaleString(undefined, { maximumFractionDigits: rowPrice >= 10 ? 2 : 5 })}</div>
+                        <div className="text-xs font-mono">${rowPrice ? rowPrice.toLocaleString(undefined, { maximumFractionDigits: rowPrice >= 10 ? 2 : 5 }) : "—"}</div>
                         <div className={`text-[10px] ${rowChange >= 0 ? "text-[color:var(--profit)]" : "text-[color:var(--loss)]"}`}>{rowChange >= 0 ? "+" : ""}{rowChange.toFixed(2)}%</div>
                       </div>
                     </button>
@@ -151,9 +225,9 @@ function Index({ session }: { session: { wallet: string; username: string } }) {
         {/* CHART */}
         <Chart
           candles={candles}
-          price={livePrice}
-          entryPrice={position?.entry}
-          liqPrice={position ? (position.dir === "LONG" ? liqL : liqS) : undefined}
+          price={displayPrice}
+          entryPrice={activePosition?.entryPrice}
+          liqPrice={activePosition?.liquidationPrice}
           isLive={!!(market.binance || market.yahoo)}
         />
 
@@ -168,42 +242,48 @@ function Index({ session }: { session: { wallet: string; username: string } }) {
             </select>
             <ChevronDown className="w-3 h-3 absolute right-1.5 top-1/2 -translate-y-1/2 pointer-events-none" />
           </div>
-          <button className="box-sm px-2 py-2 text-xs font-bold bg-white">DRAW</button>
-          <button className="box-sm px-2 py-2 text-xs font-bold bg-white">RESET</button>
         </div>
 
         {/* ACTIVE POSITION */}
-        {position && (
+        {activePosition && (
           <>
             <div className="box p-4 bg-[color:var(--yellow-accent)] space-y-3">
               <div className="flex items-center gap-2 flex-wrap">
-                <span className="box-sm px-2 py-1 text-xs font-bold bg-foreground text-background">{position.sym}</span>
-                <span className={`box-sm px-2 py-1 text-xs font-display ${position.dir === "LONG" ? "bg-[color:var(--profit)]" : "bg-[color:var(--loss)]"} text-white`}>{position.dir}</span>
-                <span className="box-sm px-2 py-1 text-xs font-bold bg-foreground text-[color:var(--cyan-accent)]">{position.lev}x</span>
-                <span className="box-sm px-2 py-1 text-xs font-bold bg-white">ISOLATED</span>
+                <span className="box-sm px-2 py-1 text-xs font-bold bg-foreground text-background">{activePosition.indexSymbol}</span>
+                <span className={`box-sm px-2 py-1 text-xs font-display ${activePosition.isLong ? "bg-[color:var(--profit)]" : "bg-[color:var(--loss)]"} text-white`}>{activePosition.isLong ? "LONG" : "SHORT"}</span>
+                <span className="box-sm px-2 py-1 text-xs font-bold bg-foreground text-[color:var(--cyan-accent)]">{activePosition.leverage.toFixed(1)}x</span>
+                <span className="box-sm px-2 py-1 text-xs font-bold bg-white">GMX v2</span>
               </div>
               <div className="border-t-2 border-foreground" />
               <div className="grid grid-cols-2 gap-y-1 text-sm">
-                <span>Entry Price:</span><span className="text-right font-mono">${position.entry.toFixed(2)}</span>
-                <span>Margin Used:</span><span className="text-right font-mono">${position.margin}</span>
-                <span>Size:</span><span className="text-right font-mono">${position.size}</span>
+                <span>Entry:</span><span className="text-right font-mono">${fmtP(activePosition.entryPrice)}</span>
+                <span>Mark:</span><span className="text-right font-mono">${fmtP(activePosition.markPrice)}</span>
+                <span>Est. Liq:</span><span className="text-right font-mono">${activePosition.liquidationPrice.toFixed(2)}</span>
+                <span>Collateral:</span><span className="text-right font-mono">${activePosition.collateralUsd.toFixed(2)}</span>
+                <span>Size:</span><span className="text-right font-mono">${activePosition.sizeUsd.toFixed(2)}</span>
+                {activePosition.triggerOrders.map((t, i) => (
+                  <span key={i} className="contents">
+                    <span>{t.type}:</span><span className="text-right font-mono">${t.triggerPrice.toFixed(2)}</span>
+                  </span>
+                ))}
               </div>
               <div className="border-t-2 border-dashed border-foreground" />
               <div className="flex items-center justify-between">
                 <span className="text-sm">Unrealized PnL:</span>
-                <span className={`font-display text-2xl ${pnl >= 0 ? "text-[color:var(--profit)]" : "text-[color:var(--loss)]"}`}>
-                  {pnl >= 0 ? "+" : ""}${pnl.toFixed(2)} <span className="text-xs">({pnl >= 0 ? "+" : ""}{pnlPct.toFixed(2)}%)</span>
+                <span className={`font-display text-2xl ${activePosition.pnl >= 0 ? "text-[color:var(--profit)]" : "text-[color:var(--loss)]"}`}>
+                  {activePosition.pnl >= 0 ? "+" : ""}${activePosition.pnl.toFixed(2)} <span className="text-xs">({activePosition.pnl >= 0 ? "+" : ""}{activePosition.pnlPct.toFixed(2)}%)</span>
                 </span>
               </div>
             </div>
-            <button onClick={() => setPosition(null)} className="box w-full py-5 font-display text-xl bg-[color:var(--yellow-accent)]">
-              CLOSE POSITION
+            <button onClick={closeActive} disabled={closing} className="box w-full py-5 font-display text-xl bg-[color:var(--yellow-accent)] flex items-center justify-center gap-2 disabled:opacity-50">
+              {closing ? <Loader2 className="w-5 h-5 animate-spin" /> : null}
+              {closing ? "CLOSING…" : "CLOSE POSITION"}
             </button>
           </>
         )}
 
         {/* TRADE PANEL */}
-        {!position && (
+        {!activePosition && (
           <>
             <div className="box p-4 bg-white space-y-4">
               <div>
@@ -215,10 +295,10 @@ function Index({ session }: { session: { wallet: string; username: string } }) {
               </div>
               <div>
                 <div className="flex items-center justify-between mb-2">
-                  <span className="font-display text-sm flex items-center gap-1">SIZE <Info className="w-3 h-3" /></span>
+                  <span className="font-display text-sm flex items-center gap-1">COLLATERAL <Info className="w-3 h-3" /></span>
                   <div className="flex items-center gap-1">
                     <span className="bg-foreground text-background text-xs font-bold px-2 py-1">{sizePct}%</span>
-                    <span className="box-sm px-2 py-1 text-xs font-bold">${sizeUsd}</span>
+                    <span className="box-sm px-2 py-1 text-xs font-bold">${collateralUsd}</span>
                   </div>
                 </div>
                 <SliderTrack value={sizePct} min={0} max={100} onChange={setSizePct} color="var(--cyan-accent)" />
@@ -232,38 +312,45 @@ function Index({ session }: { session: { wallet: string; username: string } }) {
               </div>
 
               <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-xs">
-                <span className="text-muted-foreground underline">Margin:</span><span className="text-right font-mono">${margin}</span>
-                <span className="text-muted-foreground underline">Opening Fees:</span><span className="text-right font-mono">&lt;$0.01</span>
-                <span className="text-muted-foreground">LIQ (L):</span><span className="text-right font-mono">${liqL.toFixed(2)}</span>
-                <span className="text-muted-foreground">LIQ (S):</span><span className="text-right font-mono">${liqS.toFixed(2)}</span>
+                <span className="text-muted-foreground">Position size:</span><span className="text-right font-mono">${sizeUsd.toFixed(2)}</span>
+                <span className="text-muted-foreground">Keeper fee:</span><span className="text-right font-mono">~0.0015 ETH</span>
+                <span className="text-muted-foreground">Est. Liq (L):</span><span className="text-right font-mono">${liqL.toFixed(2)}</span>
+                <span className="text-muted-foreground">Est. Liq (S):</span><span className="text-right font-mono">${liqS.toFixed(2)}</span>
+                <span className="text-muted-foreground">USDC bal:</span><span className="text-right font-mono">${balance.toFixed(2)}</span>
+                <span className="text-muted-foreground">GMX market:</span><span className="text-right font-mono">{tradable ? "✓" : "—"}</span>
               </div>
               <div className="border-t border-dashed" />
-              <div className="flex items-center gap-2">
-                <div className="box-sm w-12 h-6 relative bg-muted">
-                  <div className="absolute left-0.5 top-0.5 w-4 h-4 bg-white border-2 border-foreground" />
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-bold flex items-center gap-1">TP / SL <Info className="w-3 h-3" /></span>
+                  <span className="text-[10px] text-muted-foreground">optional · USD trigger</span>
                 </div>
-                <span className="text-xs font-bold">TP / SL PROTECT (ROE)</span>
-                <Info className="w-3 h-3" />
+                <div className="grid grid-cols-2 gap-2">
+                  <input value={tpInput} onChange={(e) => setTpInput(e.target.value.replace(/[^0-9.]/g, ""))} placeholder="Take profit $" inputMode="decimal" className="box-inset px-2 py-2 text-xs font-mono bg-white outline-none" />
+                  <input value={slInput} onChange={(e) => setSlInput(e.target.value.replace(/[^0-9.]/g, ""))} placeholder="Stop loss $" inputMode="decimal" className="box-inset px-2 py-2 text-xs font-mono bg-white outline-none" />
+                </div>
               </div>
             </div>
 
             <div className="grid grid-cols-2 gap-3">
-              <button onClick={() => open("LONG")} className="box py-5 font-display text-xl bg-[color:var(--profit)] text-white flex items-center justify-center gap-2">
-                <TrendingUp className="w-5 h-5" /> LONG
+              <button onClick={() => submitOrder(true)} disabled={!tradable || submitting} className="box py-5 font-display text-xl bg-[color:var(--profit)] text-white flex items-center justify-center gap-2 disabled:opacity-50">
+                {submitting ? <Loader2 className="w-5 h-5 animate-spin" /> : <TrendingUp className="w-5 h-5" />} LONG
               </button>
-              <button onClick={() => open("SHORT")} className="box py-5 font-display text-xl bg-[color:var(--loss)] text-white flex items-center justify-center gap-2">
-                <TrendingDown className="w-5 h-5" /> SHORT
+              <button onClick={() => submitOrder(false)} disabled={!tradable || submitting} className="box py-5 font-display text-xl bg-[color:var(--loss)] text-white flex items-center justify-center gap-2 disabled:opacity-50">
+                {submitting ? <Loader2 className="w-5 h-5 animate-spin" /> : <TrendingDown className="w-5 h-5" />} SHORT
               </button>
             </div>
-            <button onClick={() => open(Math.random() > 0.5 ? "LONG" : "SHORT")} className="box w-full py-5 font-display text-xl bg-[color:var(--magenta-accent)] text-foreground flex items-center justify-center gap-2">
-              <Shuffle className="w-5 h-5" /> I'M FEELING LUCKY
-            </button>
+            {!tradable && (
+              <div className="text-xs text-center text-muted-foreground">
+                {gmx.loading ? "Loading GMX markets…" : `${market.symbol} is not on GMX v2 — pick a market with the GMX badge.`}
+              </div>
+            )}
           </>
         )}
 
         {/* SPLASH BRAND */}
         <div className="pt-6 pb-2 text-center text-[10px] uppercase tracking-[0.2em] text-muted-foreground flex items-center justify-center gap-1">
-          <Zap className="w-3 h-3" /> @{session.username} · Flash · MiniPay Native
+          <Zap className="w-3 h-3" /> @{session.username} · Flash · GMX v2 + Squid
         </div>
       </div>
 
