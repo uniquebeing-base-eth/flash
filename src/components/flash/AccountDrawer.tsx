@@ -282,52 +282,11 @@ function ProfileTab({ session }: { session: Session }) {
           </div>
         </div>
       </div>
-      <div className="grid grid-cols-2 gap-3">
-        {[["Total Trades", "23"], ["Win Rate", "61%"], ["Total Profit", "$124.22"], ["ROI", "+10.2%"], ["Volume", "$8,450"], ["Avg Trade", "$367"]].map(([l, v]) => (
-          <div key={l} className="box-sm p-3">
-            <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{l}</div>
-            <div className="font-display text-xl">{v}</div>
-          </div>
-        ))}
-      </div>
-      <Streak />
-      <div className="box-sm p-4">
-        <div className="text-[10px] uppercase tracking-wider mb-2 text-muted-foreground">Referral</div>
-        <div className="font-mono text-sm break-all">flash.xyz/ref/{session.username}</div>
-        <div className="mt-3 grid grid-cols-3 gap-2 text-center">
-          <div><div className="text-[10px] text-muted-foreground">Refs</div><div className="font-display">0</div></div>
-          <div><div className="text-[10px] text-muted-foreground">Earnings</div><div className="font-display">$0</div></div>
-          <div><div className="text-[10px] text-muted-foreground">Volume</div><div className="font-display">$0</div></div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function Streak() {
-  const days = Array.from({ length: 7 * 12 }, (_, i) => (i * 73) % 5);
-  const shades = ["bg-white", "bg-[color:var(--cyan-accent)]/30", "bg-[color:var(--profit)]/40", "bg-[color:var(--profit)]/70", "bg-[color:var(--profit)]"];
-  return (
-    <div className="box-sm p-4 bg-[color:var(--yellow-accent)]">
-      <div className="text-[10px] uppercase tracking-wider mb-3">Trading Streak</div>
-      <div className="grid grid-cols-3 gap-2 mb-3">
-        {[["Current", "3"], ["Longest", "7"], ["Active", "12"]].map(([l, v]) => (
-          <div key={l} className="box-sm p-2 bg-white text-center">
-            <div className="text-[9px] uppercase text-muted-foreground">{l}</div>
-            <div className="font-display text-lg">{v}</div>
-          </div>
-        ))}
-      </div>
-      <div className="box-sm p-2 bg-white">
-        <div className="grid grid-cols-12 gap-[3px]">
-          {days.map((d, i) => (
-            <div key={i} className={`aspect-square border border-foreground/40 ${shades[d]}`} />
-          ))}
-        </div>
-      </div>
-      <div className="flex justify-between mt-2 text-[10px] uppercase text-muted-foreground">
-        <span>23 trades</span>
-        <div className="flex items-center gap-1">Less {shades.slice().map((s, i) => <span key={i} className={`w-3 h-3 border border-foreground/40 ${s}`} />)} More</div>
+      <div className="box-sm p-4 text-center">
+        <div className="text-[10px] uppercase tracking-wider mb-2 text-muted-foreground">Stats</div>
+        <p className="text-xs text-muted-foreground leading-relaxed">
+          Your real trading stats will appear here once you place trades on GMX v2. PnL, win rate and volume update from on-chain activity.
+        </p>
       </div>
     </div>
   );
