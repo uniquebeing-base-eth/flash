@@ -20,6 +20,13 @@ declare global {
 /** Celo Mainnet (MiniPay) — 42220 / 0xa4ec */
 export const CELO_CHAIN_ID_HEX = "0xa4ec";
 
+/** True when running inside the MiniPay in-app browser. */
+export function isMiniPay(): boolean {
+  if (typeof window === "undefined") return false;
+  const eth = window.ethereum as (Eip1193Provider & { isMiniPay?: boolean }) | undefined;
+  return eth?.isMiniPay === true;
+}
+
 export async function connectWallet(): Promise<{ address: string; provider: BrowserProvider }> {
   if (typeof window === "undefined" || !window.ethereum) {
     throw new Error("No wallet detected. Open Flash inside MiniPay.");
