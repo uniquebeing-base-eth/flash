@@ -1,9 +1,7 @@
 import { useEffect, useState, useCallback } from "react";
 import { Zap, Wallet, Check, X, Loader2 } from "lucide-react";
 import { toast } from "sonner";
-import {
-  connectWallet, getRegistry, USERNAME_REGEX, FLASH_REGISTRY_ADDRESS,
-} from "@/lib/flashContract";
+import { connectWallet, USERNAME_REGEX, isMiniPay } from "@/lib/flashContract";
 import { supabase } from "@/integrations/supabase/client";
 
 interface Session { wallet: string; username: string; }
@@ -33,22 +31,7 @@ export function UsernameGate({ children }: { children: (s: Session) => React.Rea
     try {
       const { address } = await connectWallet();
       setWallet(address);
-      // 1) check on-chain registration
-      if (FLASH_REGISTRY_ADDRESS) {
-        try {
-          const { BrowserProvider } = await import("ethers");
-          const provider = new BrowserProvider(window.ethereum!);
-          const registry = await getRegistry(provider);
-          const existing: string = await registry.usernameOf(address);
-          if (existing && existing.length > 0) {
-            const s: Session = { wallet: address, username: existing };
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
-            setSession(s);
-            return;
-          }
-        } catch { /* contract not deployed yet — fall through */ }
-      }
-      // 2) fallback: check off-chain registry
+      // check if this wallet already claimed a username
       const { data } = await supabase
         .from("usernames")
         .select("username")
@@ -88,33 +71,29 @@ export function UsernameGate({ children }: { children: (s: Session) => React.Rea
   const handleClaim = async () => {
     if (!wallet || status !== "available") return;
     setSubmitting(true);
-    let txHash: string | null = null;
     try {
-      if (FLASH_REGISTRY_ADDRESS) {
-        const { BrowserProvider } = await import("ethers");
-        const provider = new BrowserProvider(window.ethereum!);
-        const registry = await getRegistry(provider, true);
-        const tx = await registry.registerUser(username);
-        toast.loading("Confirming on-chain…", { id: "claim" });
-        const receipt = await tx.wait();
-        txHash = receipt?.hash ?? tx.hash;
-        toast.success("Username registered on-chain", { id: "claim" });
-      } else {
-        toast.message("Contract not deployed — using off-chain registry");
-      }
-      // mirror to Cloud for fast leaderboard lookups
+      // Prove wallet ownership with a signature — no gas, no on-chain tx.
+      const message = `Flash: claim @${username.toLowerCase()} for ${wallet.toLowerCase()} at ${new Date().toISOString()}`;
+      toast.loading("Sign to claim…", { id: "claim" });
+      const signature = (await window.ethereum!.request({
+        method: "personal_sign",
+        params: [message, wallet],
+      })) as string;
       const { error } = await supabase.from("usernames").insert({
         wallet_address: wallet.toLowerCase(),
         username,
         username_lower: username.toLowerCase(),
-        tx_hash: txHash,
+        signature,
+        signed_message: message,
       });
       if (error && !error.message.includes("duplicate")) throw error;
+      toast.success(`Welcome, @${username}`, { id: "claim" });
       const s: Session = { wallet, username };
       localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
       setSession(s);
     } catch (e: unknown) {
-      toast.error(e instanceof Error ? e.message : "Registration failed", { id: "claim" });
+      const msg = e instanceof Error ? e.message : "Registration failed";
+      toast.error(/reject|denied/i.test(msg) ? "Signature declined" : msg, { id: "claim" });
     } finally {
       setSubmitting(false);
     }
@@ -128,10 +107,10 @@ export function UsernameGate({ children }: { children: (s: Session) => React.Rea
       <div className="w-full max-w-md space-y-5">
         <div className="text-center space-y-2">
           <div className="inline-flex items-center gap-2 box-sm bg-[color:var(--yellow-accent)] px-3 py-1.5 text-xs font-bold uppercase tracking-wider">
-            <Zap className="w-3.5 h-3.5" /> Flash · MiniPay Native
+            <Zap className="w-3.5 h-3.5" /> Flash · {isMiniPay() ? "MiniPay Detected" : "MiniPay Native"}
           </div>
           <h1 className="font-display text-4xl">CLAIM YOUR HANDLE</h1>
-          <p className="text-sm text-muted-foreground">One transaction. One identity. Forever yours on-chain.</p>
+          <p className="text-sm text-muted-foreground">One signature. One identity. No gas required.</p>
         </div>
 
         {!wallet ? (
@@ -180,7 +159,7 @@ export function UsernameGate({ children }: { children: (s: Session) => React.Rea
               {submitting ? "CLAIMING…" : "CLAIM USERNAME"}
             </button>
             <p className="text-[10px] text-center text-muted-foreground">
-              One transaction · &lt;$0.01 gas on Celo · case-insensitive
+              Free · wallet signature only · case-insensitive
             </p>
           </div>
         )}
