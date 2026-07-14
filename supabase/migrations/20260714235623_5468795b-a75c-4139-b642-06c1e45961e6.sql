@@ -1,0 +1,1 @@
+ALTER TABLE public.usernames ADD COLUMN IF NOT EXISTS signature text, ADD COLUMN IF NOT EXISTS signed_message text; ALTER TABLE public.usernames ALTER COLUMN tx_hash DROP NOT NULL;

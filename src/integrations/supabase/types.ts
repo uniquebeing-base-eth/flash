@@ -18,6 +18,8 @@ export type Database = {
         Row: {
           id: string
           registered_at: string
+          signature: string | null
+          signed_message: string | null
           tx_hash: string | null
           username: string
           username_lower: string
@@ -26,6 +28,8 @@ export type Database = {
         Insert: {
           id?: string
           registered_at?: string
+          signature?: string | null
+          signed_message?: string | null
           tx_hash?: string | null
           username: string
           username_lower: string
@@ -34,6 +38,8 @@ export type Database = {
         Update: {
           id?: string
           registered_at?: string
+          signature?: string | null
+          signed_message?: string | null
           tx_hash?: string | null
           username?: string
           username_lower?: string
